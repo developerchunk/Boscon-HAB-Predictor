@@ -15,16 +15,65 @@
 import { GridWindField, type GridColumn, type GridColumnLevel } from "../physics/wind";
 import { uvFromDirSpeed } from "../physics/geo";
 
-export type ModelId = "gfs_seamless" | "icon_seamless" | "ecmwf_ifs025";
+/* ------------------------------------------------------------------ quota hygiene
+ * Open-Meteo's free tier allows 600 calls/min, 5,000/hour, 10,000/day, and a request with many
+ * locations, variables or days is weighted as several calls. Every fetch below goes through
+ * `omFetch`, which counts requests, turns a 429 into a readable error, and the expensive results
+ * (forecast grid, ensemble, elevation, archive months) are memoised for the life of the page so
+ * re-running a prediction with a different balloon or parachute costs no API calls.
+ */
+export const apiStats = { requests: 0, cacheHits: 0, lastError: "" };
+
+/**
+ * Endpoint selection. Defaults are the free public servers. Set in .env:
+ *   VITE_OPEN_METEO_API_KEY=...   -> paid customer API (customer-*.open-meteo.com, no hourly/daily cap)
+ *   VITE_OPEN_METEO_BASE=http://localhost:8080   -> a self-hosted Open-Meteo instance (unlimited; all
+ *       services on one host, so forecast/ensemble/archive/elevation share the base)
+ */
+const KEY = (import.meta.env.VITE_OPEN_METEO_API_KEY as string | undefined)?.trim() || "";
+const SELF = (import.meta.env.VITE_OPEN_METEO_BASE as string | undefined)?.trim().replace(/\/$/, "") || "";
+export const OM_HOSTS = {
+  forecast: SELF ? `${SELF}/v1/forecast` : KEY ? "https://customer-api.open-meteo.com/v1/forecast" : "https://api.open-meteo.com/v1/forecast",
+  ensemble: SELF ? `${SELF}/v1/ensemble` : KEY ? "https://customer-ensemble-api.open-meteo.com/v1/ensemble" : "https://ensemble-api.open-meteo.com/v1/ensemble",
+  archive: SELF ? `${SELF}/v1/forecast` : KEY ? "https://customer-historical-forecast-api.open-meteo.com/v1/forecast" : "https://historical-forecast-api.open-meteo.com/v1/forecast",
+  elevation: SELF ? `${SELF}/v1/elevation` : KEY ? "https://customer-api.open-meteo.com/v1/elevation" : "https://api.open-meteo.com/v1/elevation",
+  geocoding: "https://geocoding-api.open-meteo.com/v1/search",
+  mode: SELF ? "self-hosted" : KEY ? "customer API" : "free public API",
+};
+const withKey = (url: string) => (KEY && !SELF ? `${url}&apikey=${encodeURIComponent(KEY)}` : url);
+export class QuotaError extends Error { constructor(msg: string) { super(msg); this.name = "QuotaError"; } }
+async function omFetch(url: string, signal?: AbortSignal, what = "Open-Meteo"): Promise<any> {
+  apiStats.requests++;
+  const resp = await fetch(withKey(url), { signal });
+  if (resp.status === 429) {
+    let reason = "rate limit"; try { reason = (await resp.json()).reason ?? reason; } catch { /* ignore */ }
+    apiStats.lastError = reason;
+    throw new QuotaError(`${what}: ${reason} (free tier: 600 calls/min, 5,000/hour, 10,000/day; large requests count as several calls). Cached data from earlier runs is reused automatically; otherwise wait for the next hour.`);
+  }
+  if (!resp.ok) throw new Error(`${what} ${resp.status}: ${(await resp.text()).slice(0, 160)}`);
+  return resp.json();
+}
+const memo = new Map<string, { at: number; value: any }>();
+export async function cached<T>(key: string, ttlMs: number, make: () => Promise<T>): Promise<T> {
+  const hit = memo.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) { apiStats.cacheHits++; return hit.value as T; }
+  const value = await make();
+  memo.set(key, { at: Date.now(), value });
+  return value;
+}
+
+export type ModelId = "gfs_seamless" | "icon_seamless" | "ecmwf_ifs025" | "nomads_gfs025";
 export const MODEL_LEVELS: Record<ModelId, number[]> = {
   gfs_seamless: [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100, 70, 50, 40, 30, 20, 15, 10],
   icon_seamless: [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100, 70, 50, 30],
   ecmwf_ifs025: [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50, 10],
+  nomads_gfs025: [], // native GRIB levels come from the bridge (1000 .. 1 hPa)
 };
 export const MODEL_LABEL: Record<ModelId, string> = {
-  gfs_seamless: "NOAA GFS (0.25°, 23 levels to 10 hPa ≈ 31 km)",
-  icon_seamless: "DWD ICON (19 levels to 30 hPa ≈ 24 km)",
-  ecmwf_ifs025: "ECMWF IFS (0.25°, 14 levels to 10 hPa)",
+  nomads_gfs025: "NOAA GFS 0.25° native via local NOMADS bridge — 41 levels to 1 hPa ≈ 48 km, hourly, no quota",
+  gfs_seamless: "NOAA GFS via Open-Meteo (0.25°, 23 levels to 10 hPa ≈ 31 km)",
+  icon_seamless: "DWD ICON via Open-Meteo (19 levels to 30 hPa ≈ 24 km)",
+  ecmwf_ifs025: "ECMWF IFS via Open-Meteo (0.25°, 14 levels to 10 hPa)",
 };
 const SURFACE_AGL = [10, 80, 120, 180]; // GFS/ICON provide these above-ground winds; ECMWF only 10 m (others come back null)
 
@@ -54,7 +103,13 @@ export interface GridFetchResult {
 function isoHour(d: Date): string { return d.toISOString().slice(0, 13) + ":00"; }
 
 export async function fetchGridField(o: FetchGridOptions): Promise<GridFetchResult> {
-  const half = o.halfSpanDeg ?? 1.0, step = o.stepDeg ?? 0.5;
+  if (o.model === "nomads_gfs025") { const { fetchNomadsGrid } = await import("./nomads"); return fetchNomadsGrid(o); }
+  const half = o.halfSpanDeg ?? 1.0, step = o.stepDeg ?? 0.5; // default 5×5 columns at 0.5°, ±110 km (the CUSF/Tawhiri resolution)
+  const start0 = new Date(o.launch.getTime() - (o.hoursBefore ?? 1) * 3600e3), end0 = new Date(o.launch.getTime() + (o.hoursAfter ?? 8) * 3600e3);
+  const key = `grid|${o.model}|${o.lat.toFixed(3)},${o.lon.toFixed(3)}|${half}/${step}|${isoHour(start0)}|${isoHour(end0)}`;
+  return cached(key, 30 * 60e3, () => fetchGridFieldUncached(o, half, step));
+}
+async function fetchGridFieldUncached(o: FetchGridOptions, half: number, step: number): Promise<GridFetchResult> {
   const lats: number[] = [], lons: number[] = [];
   for (let a = -half; a <= half + 1e-9; a += step) lats.push(+(o.lat + a).toFixed(4));
   for (let b = -half; b <= half + 1e-9; b += step) lons.push(+(o.lon + b).toFixed(4));
@@ -66,10 +121,8 @@ export async function fetchGridField(o: FetchGridOptions): Promise<GridFetchResu
   for (const p of levels) vars.push(`wind_speed_${p}hPa`, `wind_direction_${p}hPa`, `geopotential_height_${p}hPa`, `temperature_${p}hPa`);
   const start = new Date(o.launch.getTime() - (o.hoursBefore ?? 1) * 3600e3);
   const end = new Date(o.launch.getTime() + (o.hoursAfter ?? 8) * 3600e3);
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${qlat.join(",")}&longitude=${qlon.join(",")}&hourly=${vars.join(",")}&models=${o.model}&wind_speed_unit=ms&timezone=UTC&start_hour=${isoHour(start)}&end_hour=${isoHour(end)}`;
-  const resp = await fetch(url, { signal: o.signal });
-  if (!resp.ok) throw new Error(`Open-Meteo ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  const raw = await resp.json();
+  const url = `${OM_HOSTS.forecast}?latitude=${qlat.join(",")}&longitude=${qlon.join(",")}&hourly=${vars.join(",")}&models=${o.model}&wind_speed_unit=ms&timezone=UTC&start_hour=${isoHour(start)}&end_hour=${isoHour(end)}`;
+  const raw = await omFetch(url, o.signal, "Open-Meteo forecast");
   const arr: any[] = Array.isArray(raw) ? raw : [raw];
   if (arr[0]?.error) throw new Error(`Open-Meteo: ${arr[0].reason}`);
   const times: string[] = arr[0].hourly.time;
@@ -112,14 +165,15 @@ export async function fetchGridField(o: FetchGridOptions): Promise<GridFetchResu
 
 /** ECMWF ensemble at one point and hour: returns perturbation profiles (member - control). */
 export async function fetchEnsemblePerturbations(lat: number, lon: number, launch: Date, signal?: AbortSignal): Promise<{ z: number[]; du: number[]; dv: number[] }[]> {
+  const hour = new Date(Math.round(launch.getTime() / 3600e3) * 3600e3);
+  return cached(`ens|${lat.toFixed(3)},${lon.toFixed(3)}|${isoHour(hour)}`, 30 * 60e3, () => fetchEnsembleUncached(lat, lon, hour, signal));
+}
+async function fetchEnsembleUncached(lat: number, lon: number, hour: Date, signal?: AbortSignal): Promise<{ z: number[]; du: number[]; dv: number[] }[]> {
   const levels = MODEL_LEVELS.ecmwf_ifs025;
   const vars: string[] = [];
   for (const p of levels) vars.push(`wind_speed_${p}hPa`, `wind_direction_${p}hPa`, `geopotential_height_${p}hPa`);
-  const hour = new Date(Math.round(launch.getTime() / 3600e3) * 3600e3);
-  const url = `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lat}&longitude=${lon}&hourly=${vars.join(",")}&models=ecmwf_ifs025&wind_speed_unit=ms&timezone=UTC&start_hour=${isoHour(hour)}&end_hour=${isoHour(hour)}`;
-  const resp = await fetch(url, { signal });
-  if (!resp.ok) throw new Error(`Open-Meteo ensemble ${resp.status}`);
-  const d = await resp.json();
+  const url = `${OM_HOSTS.ensemble}?latitude=${lat}&longitude=${lon}&hourly=${vars.join(",")}&models=ecmwf_ifs025&wind_speed_unit=ms&timezone=UTC&start_hour=${isoHour(hour)}&end_hour=${isoHour(hour)}`;
+  const d = await omFetch(url, signal, "Open-Meteo ensemble");
   const h = d.hourly;
   const control = levels.map(p => ({ z: h[`geopotential_height_${p}hPa`]?.[0], ws: h[`wind_speed_${p}hPa`]?.[0], wd: h[`wind_direction_${p}hPa`]?.[0] }));
   const out: { z: number[]; du: number[]; dv: number[] }[] = [];
@@ -139,16 +193,24 @@ export async function fetchEnsemblePerturbations(lat: number, lon: number, launc
   return out;
 }
 
-/** Copernicus DEM GLO-90 elevation via Open-Meteo, up to 100 points per call. */
+/**
+ * Copernicus DEM GLO-90 elevation via Open-Meteo, up to 100 points per call. Successive chunks are
+ * spaced 350 ms apart and a 429 (rate limit) is retried after a back-off, because a burst of
+ * back-to-back 100-point calls was observed to be throttled.
+ */
+const elevMemo = new Map<string, number>();
 export async function fetchElevations(points: [number, number][], signal?: AbortSignal): Promise<number[]> {
-  const out: number[] = [];
-  for (let i = 0; i < points.length; i += 100) {
-    const chunk = points.slice(i, i + 100);
-    const url = `https://api.open-meteo.com/v1/elevation?latitude=${chunk.map(p => p[0].toFixed(5)).join(",")}&longitude=${chunk.map(p => p[1].toFixed(5)).join(",")}`;
-    const resp = await fetch(url, { signal });
-    if (!resp.ok) throw new Error(`elevation ${resp.status}`);
-    const d = await resp.json();
-    out.push(...(d.elevation as number[]));
+  const keyOf = (p: [number, number]) => `${p[0].toFixed(3)},${p[1].toFixed(3)}`; // ~110 m cells, the DEM is 90 m
+  const out: number[] = new Array(points.length);
+  const missing: number[] = [];
+  points.forEach((p, i) => { const v = elevMemo.get(keyOf(p)); if (v !== undefined) { out[i] = v; apiStats.cacheHits++; } else missing.push(i); });
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < missing.length; i += 100) {
+    const idx = missing.slice(i, i + 100);
+    const url = `${OM_HOSTS.elevation}?latitude=${idx.map(k => points[k][0].toFixed(5)).join(",")}&longitude=${idx.map(k => points[k][1].toFixed(5)).join(",")}`;
+    const d = await omFetch(url, signal, "Open-Meteo elevation");
+    idx.forEach((k, j) => { out[k] = d.elevation[j]; elevMemo.set(keyOf(points[k]), d.elevation[j]); });
+    if (i + 100 < missing.length) await sleep(350);
   }
   return out;
 }
@@ -157,10 +219,8 @@ export async function fetchElevations(points: [number, number][], signal?: Abort
 export interface GeocodeHit { name: string; latitude: number; longitude: number; elevation: number; country_code: string; admin1?: string; admin2?: string; population?: number }
 /** Open-Meteo geocoding (GeoNames-based, no key). */
 export async function geocode(q: string, count = 8, signal?: AbortSignal): Promise<GeocodeHit[]> {
-  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=${count}&language=en&format=json`;
-  const resp = await fetch(url, { signal });
-  if (!resp.ok) throw new Error(`geocoding ${resp.status}`);
-  const d = await resp.json();
+  const url = `${OM_HOSTS.geocoding}?name=${encodeURIComponent(q)}&count=${count}&language=en&format=json`;
+  const d = await omFetch(url, signal, "Open-Meteo geocoding");
   return (d.results ?? []) as GeocodeHit[];
 }
 
@@ -184,10 +244,8 @@ export async function fetchGfsArchiveProfiles(o: { lat: number; lon: number; mon
   o.onProgress?.(0, jobs.length);
   for (const [y, mo] of jobs) {
     const last = new Date(Date.UTC(y, mo, 0)).getUTCDate();
-    const url = `https://historical-forecast-api.open-meteo.com/v1/forecast?latitude=${o.lat}&longitude=${o.lon}&start_date=${y}-${String(mo).padStart(2, "0")}-01&end_date=${y}-${String(mo).padStart(2, "0")}-${last}&hourly=${vars.join(",")}&models=gfs_seamless&wind_speed_unit=ms&timezone=UTC`;
-    const resp = await fetch(url, { signal: o.signal });
-    if (!resp.ok) throw new Error(`Open-Meteo archive ${resp.status}: ${(await resp.text()).slice(0, 160)}`);
-    const d = await resp.json();
+    const url = `${OM_HOSTS.archive}?latitude=${o.lat}&longitude=${o.lon}&start_date=${y}-${String(mo).padStart(2, "0")}-01&end_date=${y}-${String(mo).padStart(2, "0")}-${last}&hourly=${vars.join(",")}&models=gfs_seamless&wind_speed_unit=ms&timezone=UTC`;
+    const d = await cached(`arch|${o.lat.toFixed(2)},${o.lon.toFixed(2)}|${y}-${mo}`, 24 * 3600e3, () => omFetch(url, o.signal, "Open-Meteo archive"));
     const h = d.hourly; const times: string[] = h.time;
     for (let i = 0; i < times.length; i++) {
       if (!o.hoursUtc.includes(+times[i].slice(11, 13))) continue;

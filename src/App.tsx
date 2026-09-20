@@ -1,8 +1,9 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MapView, type MapData } from "./ui/MapView";
 import { BurstCalcPanel } from "./ui/BurstCalcPanel";
 import { ClimatologyPanel } from "./ui/ClimatologyPanel";
 import { MethodPanel } from "./ui/MethodPanel";
+import { Flight3D } from "./ui/Flight3D";
 import { LineChart, PlanView, LayerBars } from "./ui/charts";
 import { km, nm, ft, fl, hhmm, deg, compass, istString, utcString, istToDate, dateToIstParts } from "./ui/format";
 import { BALLOONS, balloonById } from "./physics/balloon";
@@ -10,21 +11,34 @@ import { planFill, buildFlightConfig, flyWithTerrain, type PredictInputs } from 
 import { flyTrajectory, type FlightResult } from "./physics/trajectory";
 import { ellipsePolygon, type McResult } from "./physics/montecarlo";
 import { eastNorthM, distanceM, bearingDeg, dirSpeedFromUV } from "./physics/geo";
-import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, geocode, MODEL_LABEL, type ModelId, type GridFetchResult, type GeocodeHit } from "./data/openmeteo";
+import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, geocode, apiStats, OM_HOSTS, MODEL_LABEL, type ModelId, type GridFetchResult, type GeocodeHit } from "./data/openmeteo";
 import { fetchTawhiri, type TawhiriResult } from "./data/tawhiri";
+import { bridgeOnline, NOMADS_BRIDGE } from "./data/nomads";
 import { callWorker } from "./ui/worker-client";
 
-type Tab = "predict" | "burst" | "climatology" | "method";
+type Tab = "predict" | "flight3d" | "burst" | "climatology" | "method";
 
 import { DEFAULT_INPUTS } from "./physics/defaults";
-interface Settings { model: ModelId; mcRuns: number; useEnsemble: boolean; compareTawhiri: boolean; windSigmaMs: number; burstMeanRatio: number; fillSigma: number; chuteCdSpread: number; remnant: boolean; hourSweep: boolean }
-const DEFAULT_SETTINGS: Settings = { model: "gfs_seamless", mcRuns: 300, useEnsemble: true, compareTawhiri: true, windSigmaMs: 2.5, burstMeanRatio: 1.0, fillSigma: 0.05, chuteCdSpread: 0.2, remnant: true, hourSweep: true };
+type GridDensity = "dense" | "standard" | "light";
+/**
+ * Columns fetched around the pad (Open-Meteo models only; the NOMADS bridge always returns every
+ * native grid point). Policy: data and accuracy are never traded for API quota — the default is
+ * the model's own 0.25° spacing, and caching (30 min) is what keeps repeat runs free.
+ */
+const GRID_PRESETS: Record<GridDensity, { step: number; half: number; label: string }> = {
+  dense: { step: 0.25, half: 1.0, label: "full — 9×9 columns at 0.25° (±110 km, the model's native spacing)" },
+  standard: { step: 0.5, half: 1.0, label: "5×5 columns at 0.5° (±110 km, Tawhiri's resolution)" },
+  light: { step: 0.75, half: 0.75, label: "3×3 columns at 0.75° (±80 km) — only if the API is throttling" },
+};
+interface Settings { model: ModelId; mcRuns: number; useEnsemble: boolean; compareTawhiri: boolean; windSigmaMs: number; burstMeanRatio: number; fillSigma: number; chuteCdSpread: number; remnant: boolean; hourSweep: boolean; grid: GridDensity }
+const DEFAULT_SETTINGS: Settings = { model: "gfs_seamless", mcRuns: 300, useEnsemble: true, compareTawhiri: true, windSigmaMs: 2.5, burstMeanRatio: 1.0, fillSigma: 0.05, chuteCdSpread: 0.2, remnant: true, hourSweep: true, grid: "dense" };
 
 interface Results {
   grid: GridFetchResult; plan: ReturnType<typeof planFill>; nominal: FlightResult; groundAltM: number; demIterations: number;
   mc?: McResult; ensembleN: number; tawhiri?: TawhiriResult; tawhiriError?: string;
   hourly?: { offsetH: number; lat: number; lon: number; rangeM: number; bearing: number; durationS: number }[];
   computedAt: Date;
+  demError?: string;
 }
 
 export default function App() {
@@ -37,6 +51,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [fitKey, setFitKey] = useState("");
   const abort = useRef<AbortController | null>(null);
+  const [bridge, setBridge] = useState<boolean | null>(null);
+  useEffect(() => { bridgeOnline().then(ok => { setBridge(ok); if (ok) setSet(s => (s.model === DEFAULT_SETTINGS.model ? { ...s, model: "nomads_gfs025" } : s)); }); }, []);
   const [placeQuery, setPlaceQuery] = useState("");
   const [placeHits, setPlaceHits] = useState<GeocodeHit[] | null>(null);
   const [placeBusy, setPlaceBusy] = useState(false);
@@ -67,15 +83,18 @@ export default function App() {
       const leadH = (inp.launchUtc.getTime() - Date.now()) / 3600e3;
       if (leadH > 16 * 24) throw new Error(`Launch is ${(leadH / 24).toFixed(0)} days away; GFS only reaches 16 days. Use the Climatology tab for planning, and come back within 7 days for a forecast.`);
       if (leadH < -24 * 60) throw new Error("Launch time is more than 60 days in the past; the forecast archive is not wired in for that.");
-      log(`Fetching ${MODEL_LABEL[set.model]} — 25 columns, ${set.hourSweep ? 15 : 10} hours…`);
-      const grid = await fetchGridField({ lat: inp.launchLat, lon: inp.launchLon, model: set.model, launch: inp.launchUtc, hoursBefore: set.hourSweep ? 4 : 1, hoursAfter: set.hourSweep ? 11 : 8, signal: ac.signal });
+      const req0 = apiStats.requests;
+      const gp = GRID_PRESETS[set.grid]; const nCols = (Math.round((2 * gp.half) / gp.step) + 1) ** 2;
+      if (set.model === "nomads_gfs025") log(`Fetching native GFS 0.25° from the local NOMADS bridge — every grid point within ±${gp.half}° (~${(Math.round(2 * gp.half / 0.25) + 1) ** 2} columns), ${set.hourSweep ? 15 : 10} hourly files, ~40 s the first time, instant from cache…`);
+      else log(`Fetching ${MODEL_LABEL[set.model]} — ${nCols} columns at ${gp.step}°, ${set.hourSweep ? 15 : 10} hours, via the ${OM_HOSTS.mode} (cached 30 min)…`);
+      const grid = await fetchGridField({ lat: inp.launchLat, lon: inp.launchLon, model: set.model, launch: inp.launchUtc, hoursBefore: set.hourSweep ? 4 : 1, hoursAfter: set.hourSweep ? 11 : 8, halfSpanDeg: gp.half, stepDeg: gp.step, signal: ac.signal });
       const launchTimeS = (inp.launchUtc.getTime() - grid.epochMs) / 1000;
       const atmos = grid.field.atmosphere(inp.launchLat, inp.launchLon, launchTimeS);
       const plan = planFill(inp, atmos);
       log("Flying nominal trajectory and looking up terrain at the landing point…");
       const cfg = buildFlightConfig(inp, plan, launchTimeS);
-      const { result: nominal, groundAltM, iterations } = await flyWithTerrain(grid.field, cfg, pts => fetchElevations(pts, ac.signal));
-      const partial: Results = { grid, plan, nominal, groundAltM, demIterations: iterations, ensembleN: 0, computedAt: new Date() };
+      const { result: nominal, groundAltM, iterations, demError } = await flyWithTerrain(grid.field, cfg, pts => fetchElevations(pts, ac.signal), 3);
+      const partial: Results = { grid, plan, nominal, groundAltM, demIterations: iterations, ensembleN: 0, computedAt: new Date(), demError };
       setRes({ ...partial }); setFitKey(String(Date.now()));
       // hour sweep
       if (set.hourSweep) {
@@ -104,7 +123,7 @@ export default function App() {
       partial.mc = mcMsg.result;
       setRes({ ...partial });
       await tawhiriP;
-      log(`Done at ${istString(new Date())}.`);
+      log(`Done at ${istString(new Date())} — ${apiStats.requests - req0} Open-Meteo request${apiStats.requests - req0 === 1 ? "" : "s"} this run (${apiStats.cacheHits} cache hits so far).`);
     } catch (e: any) {
       if (e?.name !== "AbortError") setError(String(e.message ?? e));
     } finally { setBusy(false); }
@@ -127,8 +146,9 @@ export default function App() {
   return <div className="app">
     <div className="topbar">
       <h1>BOSCON HAB predictor</h1><span className="note">landing prediction · burst calculator · Pune wind climatology</span>
-      <div className="tabs">{(["predict", "burst", "climatology", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", burst: "Burst calculator", climatology: "Climatology", method: "Method & sources" }[t]}</button>)}</div>
+      <div className="tabs">{(["predict", "flight3d", "burst", "climatology", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", flight3d: "3-D flight", burst: "Burst calculator", climatology: "Climatology", method: "Method & sources" }[t]}</button>)}</div>
     </div>
+    {tab === "flight3d" && <Flight3D data={res ? { nominal: res.nominal, mc: res.mc, tawhiri: res.tawhiri, grid: res.grid } : null} launchLat={inp.launchLat} launchLon={inp.launchLon} launchAltM={inp.launchAltM} />}
     {tab === "burst" && <BurstCalcPanel siteAltM={inp.launchAltM} />}
     {tab === "method" && <MethodPanel />}
     {tab === "climatology" && <ClimatologyPanel inputs={inp} />}
@@ -161,7 +181,10 @@ export default function App() {
         </> : <div className="field"><label>Sea-level descent rate <span className="unit">m/s</span></label><input type="number" step="0.1" value={inp.seaLevelDescentMs} onChange={e => up("seaLevelDescentMs", +e.target.value)} /></div>}
         <div className="field"><label>Balloon remnant carried down <span className="unit">kg</span></label><input type="number" step="0.05" value={inp.remnantKg} onChange={e => up("remnantKg", +e.target.value)} /></div>
         <h2>Wind &amp; uncertainty</h2>
-        <div className="field"><label>Forecast model</label><select value={set.model} onChange={e => upS("model", e.target.value as ModelId)}>{(Object.keys(MODEL_LABEL) as ModelId[]).map(m => <option key={m} value={m}>{MODEL_LABEL[m]}</option>)}</select></div>
+        <div className="field"><label>Forecast model</label><select value={set.model} onChange={e => upS("model", e.target.value as ModelId)}>{(Object.keys(MODEL_LABEL) as ModelId[]).map(m => <option key={m} value={m} disabled={m === "nomads_gfs025" && bridge === false}>{MODEL_LABEL[m]}{m === "nomads_gfs025" ? (bridge === false ? " — bridge offline" : bridge ? " — online" : "") : ""}</option>)}</select></div>
+        {bridge === false && <p className="note">Native-GFS bridge not detected at {NOMADS_BRIDGE}. Start it with <code>npm run bridge</code> to use NOAA's data directly with no API quota (README §3.3b).</p>}
+        <div className="field"><label>Wind grid density</label><select value={set.grid} onChange={e => upS("grid", e.target.value as GridDensity)}>{(Object.keys(GRID_PRESETS) as GridDensity[]).map(k => <option key={k} value={k}>{GRID_PRESETS[k].label}</option>)}</select></div>
+        <p className="note">Data source: {OM_HOSTS.mode}. The default is the model's full native spacing; results are cached for 30 min so repeat runs cost nothing. Use the local NOMADS bridge for every native point, all 41 levels and no quota at all.</p>
         <div className="field"><label>ECMWF ensemble for wind spread</label><input type="checkbox" checked={set.useEnsemble} onChange={e => upS("useEnsemble", e.target.checked)} /></div>
         <div className="field"><label>Fallback wind σ <span className="unit">m/s (assumed)</span></label><input type="number" step="0.5" value={set.windSigmaMs} onChange={e => upS("windSigmaMs", +e.target.value)} /></div>
         <div className="field"><label>Monte Carlo runs</label><input type="number" step="50" value={set.mcRuns} onChange={e => upS("mcRuns", +e.target.value)} /></div>
@@ -190,6 +213,7 @@ function Summary({ r, inp, tawhiriSep }: { r: Results; inp: PredictInputs; tawhi
   return <div>
     {p.warnings.map((w, i) => <div key={i} className="warn">{w}</div>)}
     {n.windClipped && <div className="warn">Part of the flight was above the top wind level of the forecast ({km(r.grid.field.topAltitude)} km); the top wind was held constant there.</div>}
+    {r.demError && <div className="warn">Landing ground height could not be read from the DEM ({r.demError.split("(")[0].trim()}); the descent was ended at the pad elevation of {inp.launchAltM.toFixed(0)} m instead.</div>}
     <h2>Fill (for the forecast pad conditions)</h2>
     <div className="kv">
       <span className="k">Neck lift to set with the scale</span><span className="v big">{(p.neckLiftKg * 1000).toFixed(0)} g</span>
@@ -246,7 +270,9 @@ function ResultCharts({ r, inp }: { r: Results; inp: PredictInputs }) {
   if (r.tawhiri) { const lo = r.tawhiri.landing.longitude > 180 ? r.tawhiri.landing.longitude - 360 : r.tawhiri.landing.longitude; const [x, y] = eastNorthM(inp.launchLat, inp.launchLon, r.tawhiri.landing.latitude, lo); refs.push({ x: x / 1000, y: y / 1000, label: "Tawhiri", color: "var(--ref)" }); }
   const col = r.grid.launchColumn;
   const speed = col.map(l => [Math.hypot(l.u, l.v), l.z / 1000] as [number, number]);
-  const dir = col.map(l => [dirSpeedFromUV(l.u, l.v)[0], l.z / 1000] as [number, number]);
+  // direction the balloon is pushed TOWARD, as a signed angle from north: W = -90 (left), N = 0, E = +90 (right), S = ±180 (edges)
+  const towardSigned = (u: number, v: number) => { const toward = (dirSpeedFromUV(u, v)[0] + 180) % 360; return ((toward + 180) % 360) - 180; };
+  const dir = col.map(l => [towardSigned(l.u, l.v), l.z / 1000] as [number, number]);
   const uSer = col.map(l => [l.u, l.z / 1000] as [number, number]), vSer = col.map(l => [l.v, l.z / 1000] as [number, number]);
   const asc = n.ascentModel?.track ?? [];
   return <>
@@ -256,12 +282,18 @@ function ResultCharts({ r, inp }: { r: Results; inp: PredictInputs }) {
     <div className="card"><h3>Altitude vs time</h3>
       <LineChart xLabel="minutes after launch" yLabel="altitude, km" series={[{ name: "ascent", color: "var(--ascent)", points: pts.filter(q => q.stage !== "descent").map(q => [(q.t - n.points[0].t) / 60, q.z / 1000]) }, { name: "descent", color: "var(--descent)", points: pts.filter(q => q.stage === "descent").map(q => [(q.t - n.points[0].t) / 60, q.z / 1000]) }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} hlines={[{ y: 13.716, label: "FL450" }, { y: 22.86, label: "FL750" }]} tooltip={(x, y) => <span>T+{x.toFixed(0)} min, {y.toFixed(1)} km</span>} /></div>
     <div className="card"><h3>Forecast wind at the pad column, launch hour</h3>
-      <div className="legend"><span><span className="sw" style={{ background: "var(--series-1)" }} />speed m/s</span><span><span className="dot" style={{ background: "var(--series-2)" }} />direction wind blows FROM, °</span></div>
-      <LineChart xLabel="speed, m/s (line) · direction from, ° (dots, ×0.1)" yLabel="altitude, km" series={[{ name: "speed", color: "var(--series-1)", points: speed }, { name: "from ° ÷10", color: "var(--series-2)", dots: true, points: dir.map(q => [q[0] / 10, q[1]]) }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} xDomain={[0, Math.max(36, ...speed.map(q => q[0])) * 1.05]} tooltip={(x, y, s) => <span>{s.name === "speed" ? `${x.toFixed(1)} m/s` : `from ${(x * 10).toFixed(0)}°`} at {y.toFixed(1)} km</span>} />
-      <div className="legend"><span><span className="sw" style={{ background: "var(--series-1)" }} />u (east +)</span><span><span className="sw" style={{ background: "var(--series-3)" }} />v (north +)</span></div>
-      <LineChart xLabel="wind component, m/s" yLabel="altitude, km" series={[{ name: "u east", color: "var(--series-1)", points: uSer }, { name: "v north", color: "var(--series-3)", points: vSer }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} vlines={[{ x: 0, label: "" }]} height={220} /></div>
+      <p className="note">Read all three bottom-to-top: the balloon climbs through these layers in order, ~3 min per km. Left: how hard the wind blows. Middle: which way the balloon is pushed at that height, laid out like the map — west on the left, east on the right (a dot at E means the wind comes from the west and carries the balloon east). Right: the same wind split into east–west and north–south parts, same orientation.</p>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div><div className="legend"><span><span className="sw" style={{ background: "var(--series-1)" }} />speed</span></div>
+          <LineChart xLabel="wind speed, m/s" yLabel="altitude, km" width={300} height={300} series={[{ name: "speed", color: "var(--series-1)", points: speed }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} xDomain={[0, Math.max(30, ...speed.map(q => q[0])) * 1.05]} tooltip={(x, y) => <span>{x.toFixed(1)} m/s at {y.toFixed(1)} km</span>} /></div>
+        <div><div className="legend"><span><span className="dot" style={{ background: "var(--series-2)" }} />direction the balloon is pushed TOWARD</span></div>
+          <LineChart xLabel="pushed toward:  S · W · N · E · S" yLabel="altitude, km" width={300} height={300} series={[{ name: "toward", color: "var(--series-2)", dots: true, points: dir }]} yFormat={v => v.toFixed(0)} xDomain={[-180, 180]} xTicks={[-180, -90, 0, 90, 180]} xFormat={v => ({ [-180]: "S", [-90]: "W", 0: "N", 90: "E", 180: "S" } as Record<number, string>)[v] ?? ""} vlines={[{ x: 0, label: "" }]} tooltip={(x, y) => { const toward = (x + 360) % 360; return <span>pushed {compass(toward)} (wind from {compass(toward + 180)}) at {y.toFixed(1)} km</span>; }} /></div>
+      </div>
+      <div className="legend" style={{ marginTop: 6 }}><span><span className="sw" style={{ background: "var(--series-1)" }} />u: east–west (right of the 0 line = pushes the balloon EAST)</span><span><span className="sw" style={{ background: "var(--series-3)" }} />v: north–south (right = pushes NORTH)</span></div>
+      <LineChart xLabel="wind component, m/s (negative = toward west / south)" yLabel="altitude, km" series={[{ name: "u east", color: "var(--series-1)", points: uSer }, { name: "v north", color: "var(--series-3)", points: vSer }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} vlines={[{ x: 0, label: "" }]} height={240} tooltip={(x, y, s) => <span>{s.name}: {x.toFixed(1)} m/s at {y.toFixed(1)} km</span>} /></div>
     <div className="card"><h3>Where the drift comes from</h3>
-      <div className="legend"><span><span className="sw" style={{ background: "var(--series-1)" }} />east</span><span><span className="sw" style={{ background: "var(--series-3)" }} />north</span></div>
+      <p className="note">One row per altitude band. Each bar is the distance the balloon moved while it was inside that band, ascent and descent added together: blue = east–west (left of 0 is west), green = north–south (left of 0 is south). Add up the blue bars and you get the landing's east offset; the green bars, its north offset. Long bars mean strong wind, long time in the band, or both — the table below separates the two.</p>
+      <div className="legend"><span><span className="sw" style={{ background: "var(--series-1)" }} />east–west</span><span><span className="sw" style={{ background: "var(--series-3)" }} />north–south</span></div>
       <LayerBars layers={n.layers} />
       <LayerTable layers={n.layers} /></div>
     {asc.length > 0 && <div className="card"><h3>Ascent rate profile used ({inp.ascentModel})</h3>
@@ -270,7 +302,8 @@ function ResultCharts({ r, inp }: { r: Results; inp: PredictInputs }) {
   </>;
 }
 
-const f1 = (m: number) => { const v = m / 1000; return (Math.abs(v) < 0.05 ? 0 : v).toFixed(1); };
+/** metres east/north -> "6.0 W / 1.7 N" (km, compass letters instead of signs; 0.0 shown without a letter) */
+const fEN = (eastM: number, northM: number) => { const e = eastM / 1000, n = northM / 1000; const fe = Math.abs(e) < 0.05 ? "0.0" : `${Math.abs(e).toFixed(1)} ${e > 0 ? "E" : "W"}`; const fn = Math.abs(n) < 0.05 ? "0.0" : `${Math.abs(n).toFixed(1)} ${n > 0 ? "N" : "S"}`; return `${fe} / ${fn}`; };
 function LayerTable({ layers }: { layers: FlightResult["layers"] }) {
   const rows = layers.filter(l => l.ascentTimeS + l.descentTimeS > 0);
   const totE = rows.reduce((s, l) => s + l.ascentEast + l.descentEast, 0), totN = rows.reduce((s, l) => s + l.ascentNorth + l.descentNorth, 0);
@@ -279,9 +312,9 @@ function LayerTable({ layers }: { layers: FlightResult["layers"] }) {
   const tE = trop.reduce((s, l) => s + l.ascentEast + l.descentEast, 0), tN = trop.reduce((s, l) => s + l.ascentNorth + l.descentNorth, 0);
   const dot = (sE * tE + sN * tN) / Math.max(1, Math.hypot(tE, tN) ** 2);
   return <>
-    <table className="t"><thead><tr><th>layer</th><th>up: min</th><th>up: E/N km</th><th>down: min</th><th>down: E/N km</th></tr></thead><tbody>
-      {rows.map(l => <tr key={l.zFrom}><td>{(l.zFrom / 1000).toFixed(0)}–{(l.zTo / 1000).toFixed(0)} km</td><td>{(l.ascentTimeS / 60).toFixed(1)}</td><td>{f1(l.ascentEast)} / {f1(l.ascentNorth)}</td><td>{(l.descentTimeS / 60).toFixed(1)}</td><td>{f1(l.descentEast)} / {f1(l.descentNorth)}</td></tr>)}
-      <tr style={{ fontWeight: 600 }}><td>total</td><td /><td colSpan={3}>{(totE / 1000).toFixed(1)} / {(totN / 1000).toFixed(1)} km</td></tr>
+    <table className="t"><thead><tr><th>layer</th><th>up: min</th><th>up: moved km (E/W · N/S)</th><th>down: min</th><th>down: moved km (E/W · N/S)</th></tr></thead><tbody>
+      {rows.map(l => <tr key={l.zFrom}><td>{(l.zFrom / 1000).toFixed(0)}–{(l.zTo / 1000).toFixed(0)} km</td><td>{(l.ascentTimeS / 60).toFixed(1)}</td><td>{fEN(l.ascentEast, l.ascentNorth)}</td><td>{(l.descentTimeS / 60).toFixed(1)}</td><td>{fEN(l.descentEast, l.descentNorth)}</td></tr>)}
+      <tr style={{ fontWeight: 600 }}><td>total</td><td /><td colSpan={3}>{fEN(totE, totN)} km</td></tr>
     </tbody></table>
     <p className="note">Below 18 km the flight moved {(Math.hypot(tE, tN) / 1000).toFixed(1)} km; above 18 km it moved {(Math.hypot(sE, sN) / 1000).toFixed(1)} km. {dot < 0 ? `The stratospheric winds ran against the tropospheric drift and undid ${(-dot * 100).toFixed(0)}% of it (a wind reversal pulling the flight back toward the pad).` : `The stratospheric winds ran with the tropospheric drift and added ${(dot * 100).toFixed(0)}% more in the same direction — no reversal on this day.`}</p>
   </>;

@@ -227,6 +227,46 @@ flight therefore goes **west** through the jet and is pulled **back east** above
 "Where the drift comes from" table quantifies the return for each forecast, and the Climatology tab's
 mean-u chart shows the sign change with altitude for any month.
 
+### 3.3a Open-Meteo quota, and what one prediction costs
+
+Open-Meteo's free tier allows 600 calls per minute, 5,000 per hour and 10,000 per day, and a
+request with many locations, variables or days is weighted as several calls (their weighting
+formula is not published in a form that can be cited here). The app therefore:
+
+* fetches a 9×9 grid of columns at the model's native 0.25° spacing (81 locations, ±110 km) over
+  a 10-hour window (15 hours with the launch-time sweep), ~100 variables per column — one request;
+* fetches the 51-member ECMWF ensemble at the pad for the launch hour — one request;
+* looks up the DEM at the landing point, at most three times — one to three requests;
+* **caches** the grid and ensemble for 30 minutes, DEM points for the session and archive months
+  for the day, so changing the balloon, fill, parachute or Monte Carlo settings and pressing
+  Predict again costs **zero** API calls. The status line reports the requests made by each run.
+
+The on-demand climatology fetch is the heavy one: each month is one request of ~92 variables
+over ~30 days. The bundled Pune archive exists so that this is not needed for the home site.
+A 429 answer is shown as a message naming the limit; the data already cached keeps working.
+The 3-D terrain reads Mapbox tiles, not Open-Meteo.
+
+### 3.3b Alternatives to the free Open-Meteo API (no quota, no loss of accuracy)
+
+| route | cost | data | setup |
+|---|---|---|---|
+| **NOAA NOMADS bridge** (recommended) | free, no key; NOAA asks for ≤120 requests/min per IP | the native GFS 0.25° GRIB2: every grid point in the box, hourly, 41 pressure levels 1000–1 hPa (≈48 km, so no held wind above 31 km), 10/80/100 m winds, model orography — no interpolation before the integrator | `npm run bridge:setup` once (Python venv + ecCodes), then `npm run bridge` alongside `npm run dev`; the app detects it and selects it |
+| Open-Meteo customer API | €29/month (Standard, 1M weighted calls/month, no hourly/daily cap) | identical to the free API | `VITE_OPEN_METEO_API_KEY=…` in `.env` |
+| self-hosted Open-Meteo | free; needs Docker and a few GB of disk | identical to the free API, served from your machine, unlimited | `docker run -p 8080:8080 ghcr.io/open-meteo/open-meteo` with the sync commands from the Open-Meteo README, then `VITE_OPEN_METEO_BASE=http://localhost:8080` |
+
+The bridge (`scripts/gfs_nomads_bridge.py`) uses NOAA's GRIB filter (their OpenDAP subsetting
+was retired in 2025), decodes with ecCodes, caches each decoded forecast hour on disk under
+`.cache/nomads` and serves the columns as JSON on `localhost:8787`. A 13-hour window for a ±1°
+box is ~13 files of 70 kB, about 40 s cold and instant afterwards. The ECMWF ensemble for the
+Monte Carlo spread and the geocoder still come from Open-Meteo (one small request each, cached);
+if those are throttled the Monte Carlo falls back to the labelled AR(1) wind spread and the
+landing ends at the pad elevation with a warning, rather than failing.
+
+**Accuracy is never traded for quota.** The default Open-Meteo grid is the full 9×9 at the
+model's native 0.25° spacing over ±1°; coarser presets exist only for a throttled API; the bridge
+always returns every native point with all 41 levels. Caching, not thinning, is what keeps repeat
+runs free.
+
 ### 3.4 Any other city in India (or anywhere)
 
 The **Predict** tab is not tied to Pune: type a place name in the "Place" box (Open-Meteo/GeoNames

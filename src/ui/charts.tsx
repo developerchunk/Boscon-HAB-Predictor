@@ -22,7 +22,7 @@ export function useTooltip() {
 }
 
 /** Generic x-y line chart. */
-export function LineChart(p: { series: Series[]; xLabel: string; yLabel: string; width?: number; height?: number; xDomain?: [number, number]; yDomain?: [number, number]; xFormat?: (v: number) => string; yFormat?: (v: number) => string; markers?: { x: number; y: number; label: string; color: string }[]; vlines?: { x: number; label: string }[]; hlines?: { y: number; label: string }[]; tooltip?: (x: number, y: number, s: Series) => ReactNode }) {
+export function LineChart(p: { series: Series[]; xLabel: string; yLabel: string; width?: number; height?: number; xDomain?: [number, number]; yDomain?: [number, number]; xFormat?: (v: number) => string; yFormat?: (v: number) => string; markers?: { x: number; y: number; label: string; color: string }[]; vlines?: { x: number; label: string }[]; hlines?: { y: number; label: string }[]; tooltip?: (x: number, y: number, s: Series) => ReactNode; xTicks?: number[] }) {
   const W = p.width ?? 520, H = p.height ?? 260, m = { l: 52, r: 14, t: 12, b: 34 };
   const all = p.series.flatMap(s => s.points).filter(q => Number.isFinite(q[0]) && Number.isFinite(q[1]));
   if (!all.length && !(p.xDomain && p.yDomain)) return <p className="note">no data</p>;
@@ -39,7 +39,7 @@ export function LineChart(p: { series: Series[]; xLabel: string; yLabel: string;
         <g className="grid">{niceTicks(y0, y1).map(t => <line key={t} x1={m.l} x2={W - m.r} y1={sy(t)} y2={sy(t)} />)}</g>
         <g className="axis"><line x1={m.l} x2={m.l} y1={m.t} y2={H - m.b} /><line x1={m.l} x2={W - m.r} y1={H - m.b} y2={H - m.b} /></g>
         {niceTicks(y0, y1).map(t => <text key={"y" + t} x={m.l - 6} y={sy(t) + 4} textAnchor="end">{yf(t)}</text>)}
-        {niceTicks(x0, x1, 6).map(t => <text key={"x" + t} x={sx(t)} y={H - m.b + 14} textAnchor="middle">{xf(t)}</text>)}
+        {(p.xTicks ?? niceTicks(x0, x1, 6)).map(t => <text key={"x" + t} x={sx(t)} y={H - m.b + 14} textAnchor="middle">{xf(t)}</text>)}
         <text x={(m.l + W - m.r) / 2} y={H - 4} textAnchor="middle">{p.xLabel}</text>
         <text transform={`translate(12 ${(m.t + H - m.b) / 2}) rotate(-90)`} textAnchor="middle">{p.yLabel}</text>
         {p.vlines?.map(v => <g key={"v" + v.x}><line x1={sx(v.x)} x2={sx(v.x)} y1={m.t} y2={H - m.b} stroke="var(--ref)" strokeDasharray="3 3" /><text x={sx(v.x) + 3} y={m.t + 10}>{v.label}</text></g>)}
@@ -98,7 +98,7 @@ export function LayerBars(p: { layers: { zFrom: number; zTo: number; ascentEast:
     <g className="grid">{ticks.map(t => <line key={t} x1={sx(t)} x2={sx(t)} y1={m.t - 4} y2={H - m.b} />)}</g>
     <line x1={sx(0)} x2={sx(0)} y1={m.t - 4} y2={H - m.b} stroke="var(--border)" />
     {ticks.map(t => <text key={"t" + t} x={sx(t)} y={H - m.b + 13} textAnchor="middle">{t}</text>)}
-    <text x={(m.l + W - m.r) / 2} y={H - 3} textAnchor="middle">net displacement in layer, km (east = solid, north = hatched)</text>
+    <text x={(m.l + W - m.r) / 2} y={H - 3} textAnchor="middle">net displacement while in the layer, km (blue = east–west, green = north–south)</text>
     {rows.map((l, i) => {
       const y = m.t + i * rowH, e = (l.ascentEast + l.descentEast) / 1000, n = (l.ascentNorth + l.descentNorth) / 1000;
       return <g key={i}>

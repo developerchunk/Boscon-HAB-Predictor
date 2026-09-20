@@ -7,18 +7,22 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "bridge": ".venv-grib/bin/python scripts/gfs_nomads_bridge.py",
+    "bridge:setup": "python3 -m venv .venv-grib && .venv-grib/bin/pip install -q eccodes certifi"
   },
   "dependencies": {
     "mapbox-gl": "^3.31.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "three": "^0.186.0"
   },
   "devDependencies": {
     "@types/mapbox-gl": "^3.4.1",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
+    "@types/three": "^0.186.0",
     "@vitejs/plugin-react": "^6.1.1",
     "oxlint": "^1.81.0",
     "tsx": "^4.23.15",

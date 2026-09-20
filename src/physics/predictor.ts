@@ -97,18 +97,20 @@ export function buildFlightConfig(inp: PredictInputs, plan: FillPlan, launchTime
 }
 
 /** Fly the nominal trajectory, then refine the ground altitude at the landing point with a DEM lookup. */
-export async function flyWithTerrain(field: WindField, cfg: FlightConfig, dem: (pts: [number, number][]) => Promise<number[]>, maxIter = 3): Promise<{ result: FlightResult; groundAltM: number; iterations: number }> {
+export async function flyWithTerrain(field: WindField, cfg: FlightConfig, dem: (pts: [number, number][]) => Promise<number[]>, maxIter = 3): Promise<{ result: FlightResult; groundAltM: number; iterations: number; demError?: string }> {
   let ground = cfg.launchAltM;
   let res = flyTrajectory(field, { ...cfg, groundAltAt: () => ground });
-  let it = 0;
+  let it = 0; let demError: string | undefined;
   for (; it < maxIter; it++) {
-    const [g] = await dem([[res.landing.lat, res.landing.lon]]);
+    let g: number;
+    try { [g] = await dem([[res.landing.lat, res.landing.lon]]); }
+    catch (e: any) { demError = String(e?.message ?? e); break; } // keep the flight; report that the ground height is the pad's
     if (!Number.isFinite(g)) break;
     if (Math.abs(g - ground) < 15) { ground = g; break; }
     ground = g;
     res = flyTrajectory(field, { ...cfg, groundAltAt: () => ground });
   }
-  return { result: res, groundAltM: ground, iterations: it };
+  return { result: res, groundAltM: ground, iterations: it, demError };
 }
 
 export interface McRequest { cfg: FlightConfig; mc: McConfig; groundAltM: number }
