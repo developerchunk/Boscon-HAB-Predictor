@@ -199,11 +199,26 @@ async function fetchEnsembleUncached(lat: number, lon: number, hour: Date, signa
  * back-to-back 100-point calls was observed to be throttled.
  */
 const elevMemo = new Map<string, number>();
+/**
+ * Ground height at points [lat, lon]. Primary source: Mapbox Terrain-RGB tiles decoded in the browser
+ * (~9 m/px at zoom 14, no Open-Meteo quota involved; formula verified in scripts/check_terrain_rgb.py).
+ * Fallback: Open-Meteo's Copernicus GLO-90 elevation API. Results are memoised per ~110 m cell.
+ */
 export async function fetchElevations(points: [number, number][], signal?: AbortSignal): Promise<number[]> {
   const keyOf = (p: [number, number]) => `${p[0].toFixed(3)},${p[1].toFixed(3)}`; // ~110 m cells, the DEM is 90 m
   const out: number[] = new Array(points.length);
   const missing: number[] = [];
   points.forEach((p, i) => { const v = elevMemo.get(keyOf(p)); if (v !== undefined) { out[i] = v; apiStats.cacheHits++; } else missing.push(i); });
+  if (missing.length) {
+    try {
+      const { terrainRgbAvailable, elevationsFromTerrainRgb } = await import("./terrainrgb");
+      if (terrainRgbAvailable()) {
+        const vals = await elevationsFromTerrainRgb(missing.map(k => points[k]));
+        missing.forEach((k, j) => { out[k] = vals[j]; elevMemo.set(keyOf(points[k]), vals[j]); });
+        return out;
+      }
+    } catch { /* fall through to Open-Meteo */ }
+  }
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
   for (let i = 0; i < missing.length; i += 100) {
     const idx = missing.slice(i, i + 100);

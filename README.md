@@ -161,8 +161,9 @@ post-burst transient is < 150 m of fall (Renegar: canopies inflate "within a few
   (~70 kB). Interpolation: bilinear in lat/lon, linear in time, linear in altitude — the scheme of
   Tawhiri's `interpolate.pyx`. Above the top level the top wind is held and the run is flagged.
 * Integrator: RK4, 5 s step, state (lat, lon, z), Tawhiri's spherical stepping (R = 6371009 m + z).
-* Terrain: landing ends at the Copernicus DEM GLO-90 elevation (Open-Meteo elevation API), re-flown
-  until converged within 15 m. Tawhiri uses a 15" DEM; ASTRA stops at 0 m.
+* Terrain: landing ends at the ground height from Mapbox Terrain-RGB tiles (≈9 m/px at zoom 14; the
+  Copernicus GLO-90 API is the fallback), re-flown until converged within 15 m. Tawhiri uses a 15"
+  DEM; ASTRA stops at 0 m.
 
 **Verified:**
 * uniform wind, constant ascent, steady descent: displacement equals U·(t_up + t_down) to 0.5%
@@ -236,7 +237,8 @@ formula is not published in a form that can be cited here). The app therefore:
 * fetches a 9×9 grid of columns at the model's native 0.25° spacing (81 locations, ±110 km) over
   a 10-hour window (15 hours with the launch-time sweep), ~100 variables per column — one request;
 * fetches the 51-member ECMWF ensemble at the pad for the launch hour — one request;
-* looks up the DEM at the landing point, at most three times — one to three requests;
+* looks up the ground height at the landing point (up to three refinements) from Mapbox Terrain-RGB
+  tiles decoded in the browser — no Open-Meteo call; the Copernicus elevation API is only the fallback;
 * **caches** the grid and ensemble for 30 minutes, DEM points for the session and archive months
   for the day, so changing the balloon, fill, parachute or Monte Carlo settings and pressing
   Predict again costs **zero** API calls. The status line reports the requests made by each run.
