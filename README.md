@@ -42,6 +42,24 @@ Verified 2026-09-20: `scripts/check_terrain_rgb.py` decodes the tile under the p
 Konkan to their known heights; in the browser every raster tile reports state `loaded` and the
 ground at zoom 15 around the pad renders in the 700 m colour of the legend.
 
+## Hosting on Vercel
+
+The app is a static Vite build, so Vercel serves it from the repository with no server code.
+`vercel.json` sets the framework, build command and cache headers for the bundled data files.
+
+1. In the Vercel team, **Add New → Project → Import Git Repository**, connect GitHub if it is not yet
+   connected, and pick `developerchunk/Boscon-HAB-Predictor` (root directory: the repo root).
+2. Add the environment variable `VITE_MAPBOX_TOKEN` = your **public** `pk.` Mapbox token for
+   Production and Preview (Vite inlines it at build time, which is fine for a public token; a
+   secret `sk.` token must never be used here).
+3. Deploy. Every push to `main` then redeploys automatically.
+
+On the hosted site the wind source defaults to Open-Meteo; the NOMADS bridge is a local Python
+service, and the page still detects one running on the visitor's own machine at
+`http://localhost:8787` (Chrome and Firefox allow that from an https page). To give the whole team
+the native-GFS path without running it locally, host `scripts/gfs_nomads_bridge.py` on a small
+always-on server (Railway, a VPS) and set `VITE_NOMADS_BRIDGE` to its https URL.
+
 ---
 
 ## 1. What it computes
