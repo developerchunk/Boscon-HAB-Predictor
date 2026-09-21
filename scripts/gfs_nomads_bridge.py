@@ -9,6 +9,8 @@ GET /gfs?lat=18.286&lon=74.123&start=2026-09-21T04:00Z&end=2026-09-21T16:00Z&hal
   -> JSON {run, times[], columns[{lat, lon, elevation, times[[{z,u,v,T,p}...]]}]}
      for every native 0.25 deg grid point within +-half degrees, hourly, 41 pressure levels
      (1000 hPa .. 0.01 hPa) plus the 10/80/100 m winds, straight from the GFS GRIB files.
+     Each level also carries relative humidity (rh, %) and cloud fraction (cc, %); each hour has a
+     surface record sfc = {precipMmH, cloud (total, %), cape (J/kg), rh2m (%)}.
 
 Source: https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25_1hr.pl (NOAA NCEP, public, no key;
 NOMADS asks for <= 120 requests/minute per IP). Files are ~70 kB per forecast hour for a 2.5 deg box.
@@ -36,7 +38,7 @@ LOCK = threading.Semaphore(4)   # parallel downloads, well inside NOMADS' per-mi
 
 def grib_url(run: datetime, fhr: int, box):
     q = {"dir": f"/gfs.{run:%Y%m%d}/{run:%H}/atmos", "file": f"gfs.t{run:%H}z.pgrb2.0p25.f{fhr:03d}",
-         "var_UGRD": "on", "var_VGRD": "on", "var_HGT": "on", "var_TMP": "on", "all_lev": "on", "subregion": "",
+         "var_UGRD": "on", "var_VGRD": "on", "var_HGT": "on", "var_TMP": "on", "var_RH": "on", "var_TCDC": "on", "var_PRATE": "on", "var_CAPE": "on", "all_lev": "on", "subregion": "",
          "toplat": box[3], "bottomlat": box[1], "leftlon": box[0], "rightlon": box[2]}
     return FILTER + "?" + urllib.parse.urlencode(q)
 
@@ -67,14 +69,14 @@ def decode(data: bytes):
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".grb2", delete=False) as tf:
         tf.write(data); path = tf.name
-    out = {"levels": {}, "agl": {}, "orog": None, "t2": None, "lats": None, "lons": None}
+    out = {"levels": {}, "agl": {}, "orog": None, "t2": None, "lats": None, "lons": None, "sfc": {}}
     try:
         with open(path, "rb") as f:
             while True:
                 gid = eccodes.codes_grib_new_from_file(f)
                 if gid is None:
                     break
-                sn = eccodes.codes_get(gid, "shortName"); lt = eccodes.codes_get(gid, "typeOfLevel"); lv = eccodes.codes_get(gid, "level")
+                sn = eccodes.codes_get(gid, "shortName"); lt = eccodes.codes_get(gid, "typeOfLevel"); lv = eccodes.codes_get(gid, "level"); st = eccodes.codes_get(gid, "stepType")
                 if out["lats"] is None:
                     ni = eccodes.codes_get(gid, "Ni"); nj = eccodes.codes_get(gid, "Nj")
                     la1 = eccodes.codes_get(gid, "latitudeOfFirstGridPointInDegrees"); lo1 = eccodes.codes_get(gid, "longitudeOfFirstGridPointInDegrees")
@@ -94,6 +96,14 @@ def decode(data: bytes):
                     out["t2"] = vals
                 elif lt == "surface" and sn == "orog":
                     out["orog"] = vals
+                elif lt == "surface" and sn == "prate" and st == "instant":
+                    out["sfc"]["prate"] = vals          # kg m-2 s-1 == mm/s
+                elif lt == "surface" and sn == "cape":
+                    out["sfc"]["cape"] = vals
+                elif lt == "atmosphere" and sn == "tcc" and st == "instant":
+                    out["sfc"]["tcc"] = vals
+                elif lt == "heightAboveGround" and sn == "2r":
+                    out["sfc"]["rh2"] = vals
                 eccodes.codes_release(gid)
     finally:
         os.unlink(path)
@@ -137,7 +147,7 @@ def build(lat: float, lon: float, start: datetime, end: datetime, half: float):
         raise RuntimeError(f"requested window {start:%Y-%m-%dT%H}Z..{end:%Y-%m-%dT%H}Z is outside run {run:%Y-%m-%d %H}Z (+0..384 h)")
 
     def one(f):
-        key = hashlib.md5(f"{run:%Y%m%d%H}|{f}|{box}".encode()).hexdigest()
+        key = hashlib.md5(f"v2|{run:%Y%m%d%H}|{f}|{box}".encode()).hexdigest()
         cp = os.path.join(CACHE, key + ".json")
         if os.path.exists(cp):
             d = json.load(open(cp))
@@ -179,14 +189,22 @@ def build(lat: float, lon: float, start: datetime, end: datetime, half: float):
                         p_sfc = p * math.exp(G * (z - elev) / (R * L["t"][k]))
                     if z < elev + 150:      # level is underground or inside the near-surface layer we already have
                         continue
-                    lv.append({"z": z, "u": L["u"][k], "v": L["v"][k], "T": L["t"][k], "p": p})
+                    q = {"z": z, "u": L["u"][k], "v": L["v"][k], "T": L["t"][k], "p": p}
+                    if "r" in L: q["rh"] = L["r"][k]
+                    if "tcc" in L: q["cc"] = L["tcc"][k]
+                    lv.append(q)
                 for q in lv:
                     if q["p"] is None:
                         ps = p_sfc or 101325.0
                         q["p"] = ps * math.exp(-G * q["agl"] / (R * q["T"])); del q["agl"]
                 lv.sort(key=lambda q: q["z"])
                 times.append(lv)
-            columns.append({"lat": la, "lon": lo, "elevation": elev, "times": times})
+            sfc = []
+            for f in fhrs:
+                S = frames[f].get("sfc", {})
+                sfc.append({"precipMmH": (S["prate"][k] * 3600.0) if "prate" in S else None, "cloud": S["tcc"][k] if "tcc" in S else None,
+                            "cape": S["cape"][k] if "cape" in S else None, "rh2m": S["rh2"][k] if "rh2" in S else None})
+            columns.append({"lat": la, "lon": lo, "elevation": elev, "times": times, "sfc": sfc})
     valid = [(run + timedelta(hours=f)).strftime("%Y-%m-%dT%H:%M") for f in fhrs]
     return {"run": f"{run:%Y-%m-%dT%H}:00Z", "times": valid, "lats": lats, "lons": lons, "columns": columns,
             "source": f"NOAA GFS 0.25° run {run:%Y-%m-%d %H}Z via NOMADS grib filter, {len(first['levels'])} pressure levels, native grid"}

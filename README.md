@@ -52,6 +52,7 @@ ground at zoom 15 around the pad renders in the 700 m colour of the legend.
 | **Burst calculator** | balloon, gas, payload, site elevation, fill, chute | the physical model next to the CUSF/SondeHub calculator; ascent-rate-vs-altitude for three drag models; sensitivity of burst altitude and time to fill (±10%) and to burst diameter (±10%) |
 | **Climatology** | radiosonde station or the GFS archive, months, years, sounding hour | wind speed percentiles and mean vector by altitude (with the direction reversal), month-by-month table, GFS-vs-radiosonde check, and the vehicle flown on every real atmosphere: landing scatter, range percentiles, bearing rose |
 | **Predict › temperature** | – | projected air temperature and pressure: pad-column profile against the ISA, the temperature at the balloon over flight time, coldest point, minutes at or below −20/−40/−60 °C, and the full pressure-level table (hPa, height, °C, wind); the 3-D view shows °C and hPa on the balloon label and on the altitude ticks |
+| **Predict › humidity, cloud, rain** | – | RH and cloud fraction by altitude, cloud and icing-risk bands, time in cloud, surface rain/probability/cloud/CAPE at the pad over the window and at the landing zone around touchdown, from the same model as the winds (the bridge decodes RH, cloud, PRATE and CAPE from the GRIB) |
 | **Method & sources** | – | the formulas, constants and verification status, in the app |
 
 ---

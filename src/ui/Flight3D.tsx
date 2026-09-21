@@ -16,14 +16,14 @@ import { CSS2DRenderer, CSS2DObject } from "three/examples/jsm/renderers/CSS2DRe
 import type { FlightResult } from "../physics/trajectory";
 import type { McResult } from "../physics/montecarlo";
 import type { TawhiriResult } from "../data/tawhiri";
-import type { GridFetchResult } from "../data/openmeteo";
+import type { GridFetchResult, WeatherColumn } from "../data/openmeteo";
 import { fetchElevations } from "../data/openmeteo";
 import { eastNorthM, offsetLatLon, dirSpeedFromUV } from "../physics/geo";
 import { ELEV_STOPS } from "./MapView";
 import { isa } from "../physics/atmosphere";
 import { hhmm, compass, km } from "./format";
 
-export interface Flight3DData { nominal: FlightResult; mc?: McResult; tawhiri?: TawhiriResult; grid: GridFetchResult }
+export interface Flight3DData { nominal: FlightResult; mc?: McResult; tawhiri?: TawhiriResult; grid: GridFetchResult; weather?: WeatherColumn }
 interface Terrain { lat0: number; lon0: number; x0: number; x1: number; z0: number; z1: number; n: number; elev: number[]; key: string }
 
 function rampColor(m: number): THREE.Color {
@@ -283,7 +283,15 @@ export function Flight3D({ data, launchLat, launchLon, launchAltM }: { data: Fli
     const el = t.balloonLabel.element as HTMLDivElement;
     const st = data.grid.field.atmosphere(lat, lon, target).state(z);
     const tempC = st.T - 273.15, hPa = st.p / 100;
-    el.textContent = `${descending ? "⬇ under parachute" : "⬆ balloon Ø×" + Math.min(4.5, grow).toFixed(1)} · T+${hhmm(tSec)} · ${(z / 1000).toFixed(1)} km · ${(Math.hypot(x, zz)).toFixed(1)} km out · ${tempC.toFixed(0)} °C · ${hPa.toFixed(hPa < 100 ? 1 : 0)} hPa`;
+    let wx = "";
+    const lv = data.weather?.levels;
+    if (lv && lv.length) {
+      let rh = lv[0].rh, cc = lv[0].cloud;
+      if (z >= lv[lv.length - 1].z) { rh = lv[lv.length - 1].rh; cc = lv[lv.length - 1].cloud; }
+      else for (let i = 1; i < lv.length; i++) if (lv[i].z >= z) { const a = lv[i - 1], b = lv[i], f = (z - a.z) / (b.z - a.z); rh = a.rh + f * (b.rh - a.rh); cc = a.cloud + f * (b.cloud - a.cloud); break; }
+      wx = ` · RH ${rh.toFixed(0)}%${cc >= 50 ? " · ☁ in cloud" : cc >= 20 ? ` · cloud ${cc.toFixed(0)}%` : ""}`;
+    }
+    el.textContent = `${descending ? "⬇ under parachute" : "⬆ balloon Ø×" + Math.min(4.5, grow).toFixed(1)} · T+${hhmm(tSec)} · ${(z / 1000).toFixed(1)} km · ${(Math.hypot(x, zz)).toFixed(1)} km out · ${tempC.toFixed(0)} °C · ${hPa.toFixed(hPa < 100 ? 1 : 0)} hPa${wx}`;
     el.style.color = tempC <= -40 ? "#6ea8ff" : tempC <= 0 ? "#9cc4ff" : "";
     t.balloonLabel.position.set(0, descending ? 3 : Math.min(4.5, grow) + 1, 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps

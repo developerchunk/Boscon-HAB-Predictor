@@ -12,7 +12,7 @@ import { flyTrajectory, type FlightResult } from "./physics/trajectory";
 import { ellipsePolygon, type McResult } from "./physics/montecarlo";
 import { eastNorthM, distanceM, bearingDeg, dirSpeedFromUV } from "./physics/geo";
 import { isa } from "./physics/atmosphere";
-import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, geocode, apiStats, OM_HOSTS, MODEL_LABEL, type ModelId, type GridFetchResult, type GeocodeHit } from "./data/openmeteo";
+import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, fetchWeatherColumn, fetchSurfaceWeather, weatherCodeText, geocode, apiStats, OM_HOSTS, MODEL_LABEL, type ModelId, type GridFetchResult, type GeocodeHit, type WeatherColumn, type SurfaceWx } from "./data/openmeteo";
 import { fetchTawhiri, type TawhiriResult } from "./data/tawhiri";
 import { bridgeOnline, NOMADS_BRIDGE } from "./data/nomads";
 import { callWorker } from "./ui/worker-client";
@@ -40,6 +40,9 @@ interface Results {
   hourly?: { offsetH: number; lat: number; lon: number; rangeM: number; bearing: number; durationS: number }[];
   computedAt: Date;
   demError?: string;
+  weather?: WeatherColumn;
+  landingWx?: SurfaceWx[];
+  weatherError?: string;
 }
 
 export default function App() {
@@ -97,6 +100,16 @@ export default function App() {
       const { result: nominal, groundAltM, iterations, demError } = await flyWithTerrain(grid.field, cfg, pts => fetchElevations(pts, ac.signal), 3);
       const partial: Results = { grid, plan, nominal, groundAltM, demIterations: iterations, ensembleN: 0, computedAt: new Date(), demError };
       setRes({ ...partial }); setFitKey(String(Date.now()));
+      // humidity, cloud and rain: from the bridge's GRIB when that is the source, else one small Open-Meteo request each for the pad column and the landing zone
+      try {
+        if (grid.weather && grid.surfaceAt) { partial.weather = grid.weather; partial.landingWx = grid.surfaceAt(nominal.landing.lat, nominal.landing.lon); }
+        else if (set.model !== "nomads_gfs025") {
+          log("Fetching humidity, cloud and rain for the pad column and the landing zone (waits out a per-minute limit if needed)…");
+          partial.weather = await fetchWeatherColumn({ lat: inp.launchLat, lon: inp.launchLon, model: set.model, launch: inp.launchUtc, hoursBefore: set.hourSweep ? 4 : 1, hoursAfter: set.hourSweep ? 11 : 8, signal: ac.signal });
+          partial.landingWx = await fetchSurfaceWeather({ lat: nominal.landing.lat, lon: nominal.landing.lon, model: set.model, launch: inp.launchUtc, signal: ac.signal });
+        }
+      } catch (e: any) { partial.weatherError = String(e?.message ?? e); }
+      setRes({ ...partial });
       // hour sweep
       if (set.hourSweep) {
         const hourly: Results["hourly"] = [];
@@ -149,7 +162,7 @@ export default function App() {
       <h1>BOSCON HAB predictor</h1><span className="note">landing prediction · burst calculator · Pune wind climatology</span>
       <div className="tabs">{(["predict", "flight3d", "burst", "climatology", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", flight3d: "3-D flight", burst: "Burst calculator", climatology: "Climatology", method: "Method & sources" }[t]}</button>)}</div>
     </div>
-    {tab === "flight3d" && <Flight3D data={res ? { nominal: res.nominal, mc: res.mc, tawhiri: res.tawhiri, grid: res.grid } : null} launchLat={inp.launchLat} launchLon={inp.launchLon} launchAltM={inp.launchAltM} />}
+    {tab === "flight3d" && <Flight3D data={res ? { nominal: res.nominal, mc: res.mc, tawhiri: res.tawhiri, grid: res.grid, weather: res.weather } : null} launchLat={inp.launchLat} launchLon={inp.launchLon} launchAltM={inp.launchAltM} />}
     {tab === "burst" && <BurstCalcPanel siteAltM={inp.launchAltM} />}
     {tab === "method" && <MethodPanel />}
     {tab === "climatology" && <ClimatologyPanel inputs={inp} />}
@@ -298,6 +311,7 @@ function ResultCharts({ r, inp }: { r: Results; inp: PredictInputs }) {
       <LayerBars layers={n.layers} />
       <LayerTable layers={n.layers} /></div>
     <TemperatureCard r={r} />
+    <WeatherCard r={r} inp={inp} />
     {asc.length > 0 && <div className="card"><h3>Ascent rate profile used ({inp.ascentModel})</h3>
       <LineChart xLabel="ascent rate, m/s" yLabel="altitude, km" series={[{ name: "v", color: "var(--series-1)", points: asc.map(t => [t.v, t.z / 1000]) }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(1)} xDomain={[0, Math.max(...asc.map(t => t.v)) * 1.1]} height={220} />
       <p className="note">Cd curve scale factor {n.ascentModel!.cdScale.toFixed(2)} to hit {r.plan.padAscentMs.toFixed(2)} m/s at the pad.</p></div>}
@@ -346,6 +360,80 @@ function TemperatureCard({ r }: { r: Results }) {
       <p className="note">Rows are the model's own pressure levels, top of the atmosphere first. The last few rows are the 10–180 m above-ground winds; their pressure is derived hydrostatically from the surface pressure. Height is the model's geopotential height for that level, which is what the balloon's altitude is matched against.</p>
     </details>
     <p className="note">Source: the forecast model's temperature at each pressure level ({r.grid.field.label.split(",")[0]}), interpolated linearly between levels — the same column the ascent and descent use for air density. These are free-air temperatures; the payload box will run warmer in sunlight and cooler in shade, and the batteries' own self-heating is not included. The tropics have a colder, higher tropopause than the ISA, which is why the forecast line bends well below the dashed one near 17 km.</p>
+  </div>;
+}
+
+/** Interpolate a weather-level property at altitude z (m). */
+function wxAt(levels: { z: number; rh: number; cloud: number }[], z: number): { rh: number; cloud: number } | null {
+  if (!levels.length) return null;
+  if (z <= levels[0].z) return { rh: levels[0].rh, cloud: levels[0].cloud };
+  const n = levels.length; if (z >= levels[n - 1].z) return { rh: levels[n - 1].rh, cloud: levels[n - 1].cloud };
+  let lo = 0, hi = n - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (levels[m].z <= z) lo = m; else hi = m; }
+  const f = (z - levels[lo].z) / (levels[hi].z - levels[lo].z);
+  return { rh: levels[lo].rh + f * (levels[hi].rh - levels[lo].rh), cloud: levels[lo].cloud + f * (levels[hi].cloud - levels[lo].cloud) };
+}
+/** Contiguous altitude bands (km) where pred holds along the level list, sampled every 250 m. */
+function bands(levels: { z: number; rh: number; cloud: number; T: number }[], pred: (w: { rh: number; cloud: number; T: number }) => boolean): [number, number][] {
+  const out: [number, number][] = []; if (!levels.length) return out;
+  let start: number | null = null;
+  for (let z = levels[0].z; z <= levels[levels.length - 1].z; z += 250) {
+    const w = wxAt(levels, z)!; let T = levels[0].T;
+    for (let i = 1; i < levels.length; i++) if (levels[i].z >= z) { const a = levels[i - 1], b = levels[i]; T = a.T + ((z - a.z) / (b.z - a.z)) * (b.T - a.T); break; }
+    const ok = pred({ ...w, T });
+    if (ok && start === null) start = z; if (!ok && start !== null) { out.push([start / 1000, z / 1000]); start = null; }
+  }
+  if (start !== null) out.push([start / 1000, levels[levels.length - 1].z / 1000]);
+  return out;
+}
+const fmtBands = (b: [number, number][]) => (b.length ? b.map(([a, c]) => `${a.toFixed(1)}–${c.toFixed(1)} km`).join(", ") : "none");
+
+/**
+ * Humidity, cloud and rain from the same model as the winds: relative humidity and cloud fraction on
+ * every pressure level of the pad column at launch hour; the surface weather series at the pad over the
+ * window and at the landing zone around touchdown. Cloud bands, icing-risk bands and time in cloud are
+ * derived from the pad column along the nominal flight.
+ */
+function WeatherCard({ r, inp }: { r: Results; inp: PredictInputs }) {
+  const w = r.weather;
+  if (!w) return <div className="card"><h3>Humidity, cloud and rain</h3><p className="note">{r.weatherError ? `Not available: ${r.weatherError}` : "Loading…"}</p></div>;
+  const n = r.nominal;
+  const lv = w.levels;
+  const rhSer = lv.map(l => [l.rh, l.z / 1000] as [number, number]), ccSer = lv.map(l => [l.cloud, l.z / 1000] as [number, number]);
+  const cloudBands = bands(lv, x => x.cloud >= 50);
+  const icingBands = bands(lv, x => x.rh >= 90 && x.T <= 273.15 && x.T >= 253.15);
+  // time in cloud along the nominal flight (pad column, cloud fraction >= 50 %)
+  const step = Math.max(1, Math.floor(n.points.length / 500));
+  let inCloudUp = 0, inCloudDown = 0, dt = 0;
+  for (let i = step; i < n.points.length; i += step) { const q = n.points[i]; dt = q.t - n.points[i - step].t; const x = wxAt(lv, q.z); if (x && x.cloud >= 50) { if (q.stage === "descent") inCloudDown += dt; else inCloudUp += dt; } }
+  const launchMs = inp.launchUtc.getTime(), touchMs = launchMs + n.durationS * 1000;
+  const fmtT = (ms: number) => istString(new Date(ms)).slice(11, 16);
+  const padRows = w.surface.filter(s => s.timeMs >= launchMs - 4 * 3600e3 && s.timeMs <= launchMs + 8 * 3600e3);
+  const landRows = (r.landingWx ?? []).filter(s => s.timeMs >= touchMs - 2.5 * 3600e3 && s.timeMs <= touchMs + 2.5 * 3600e3);
+  const atTouch = (r.landingWx ?? []).reduce<SurfaceWx | null>((best, s) => (!best || Math.abs(s.timeMs - touchMs) < Math.abs(best.timeMs - touchMs) ? s : best), null);
+  const atLaunch = w.surface.reduce<SurfaceWx | null>((best, s) => (!best || Math.abs(s.timeMs - launchMs) < Math.abs(best.timeMs - launchMs) ? s : best), null);
+  const pct = (v: number | null) => (v == null ? "–" : `${Math.round(v)}%`);
+  const mm = (v: number | null) => (v == null ? "–" : v.toFixed(1));
+  const cape = (v: number | null) => (v == null ? "–" : `${Math.round(v)} J/kg`);
+  const rowsTable = (rows: SurfaceWx[], highlightMs: number) => <table className="t"><thead><tr><th>IST</th><th>rain mm/h</th><th>prob.</th><th>cloud</th><th>low / mid / high</th><th>RH 2 m</th><th>CAPE</th><th>weather</th></tr></thead><tbody>
+    {rows.map(s => <tr key={s.timeMs} style={Math.abs(s.timeMs - highlightMs) < 1800e3 ? { fontWeight: 600 } : undefined}><td>{fmtT(s.timeMs)}</td><td>{mm(s.precipMm)}</td><td>{pct(s.precipProb)}</td><td>{pct(s.cloud)}</td><td>{s.cloudLow == null ? "–" : `${Math.round(s.cloudLow)} / ${Math.round(s.cloudMid ?? 0)} / ${Math.round(s.cloudHigh ?? 0)}`}</td><td>{pct(s.rh2m)}</td><td>{cape(s.cape)}</td><td>{s.weatherCode == null ? "–" : weatherCodeText(s.weatherCode)}</td></tr>)}
+  </tbody></table>;
+  return <div className="card"><h3>Humidity, cloud and rain</h3>
+    <div className="kv">
+      <span className="k">At launch, pad</span><span className="v">{atLaunch ? `${atLaunch.weatherCode == null ? "" : weatherCodeText(atLaunch.weatherCode) + ", "}cloud ${pct(atLaunch.cloud)}, rain ${mm(atLaunch.precipMm)} mm/h${atLaunch.precipProb == null ? "" : ` (${pct(atLaunch.precipProb)})`}, RH ${pct(atLaunch.rh2m)}, CAPE ${cape(atLaunch.cape)}` : "–"}</span>
+      <span className="k">At touchdown, landing zone ({fmtT(touchMs)})</span><span className="v big">{atTouch ? `${atTouch.weatherCode == null ? "" : weatherCodeText(atTouch.weatherCode) + ", "}rain ${mm(atTouch.precipMm)} mm/h${atTouch.precipProb == null ? "" : ` (${pct(atTouch.precipProb)})`}, cloud ${pct(atTouch.cloud)}` : "–"}</span>
+      <span className="k">Cloud layers in the pad column (cover ≥ 50%)</span><span className="v">{fmtBands(cloudBands)}</span>
+      <span className="k">Time in cloud: ascent · descent</span><span className="v">{(inCloudUp / 60).toFixed(0)} · {(inCloudDown / 60).toFixed(0)} min</span>
+      <span className="k">Icing-risk band (RH ≥ 90%, 0 to −20 °C)</span><span className="v">{fmtBands(icingBands)}</span>
+    </div>
+    <div className="legend" style={{ marginTop: 6 }}><span><span className="sw" style={{ background: "var(--series-1)" }} />relative humidity</span><span><span className="sw" style={{ background: "var(--series-2)" }} />cloud fraction</span></div>
+    <LineChart xLabel="percent" yLabel="altitude, km" series={[{ name: "RH", color: "var(--series-1)", points: rhSer }, { name: "cloud", color: "var(--series-2)", points: ccSer }]} xDomain={[0, 100]} yDomain={[0, Math.max(35, n.burst.z / 1000 + 2)]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} vlines={[{ x: 50, label: "" }, { x: 90, label: "90" }]} hlines={[{ y: n.burst.z / 1000, label: "burst" }]} tooltip={(x, y, s) => <span>{s.name} {x.toFixed(0)}% at {y.toFixed(1)} km</span>} />
+    <h3 style={{ marginTop: 12 }}>Surface weather at the pad, launch window</h3>
+    <div className="legend"><span><span className="sw" style={{ background: "var(--series-2)" }} />cloud cover %</span><span><span className="sw" style={{ background: "var(--series-1)" }} />rain probability %</span></div>
+    <LineChart xLabel="hours from launch (IST on the table)" yLabel="percent" series={[{ name: "cloud", color: "var(--series-2)", points: padRows.filter(s => s.cloud != null).map(s => [(s.timeMs - launchMs) / 3600e3, s.cloud!]) }, { name: "rain probability", color: "var(--series-1)", points: padRows.filter(s => s.precipProb != null).map(s => [(s.timeMs - launchMs) / 3600e3, s.precipProb!]) }]} yDomain={[0, 100]} yFormat={v => v.toFixed(0)} xFormat={v => (v > 0 ? "+" : "") + v.toFixed(0)} vlines={[{ x: 0, label: "launch" }, { x: n.durationS / 3600, label: "landing" }]} height={200} />
+    <LineChart xLabel="hours from launch" yLabel="rain, mm per hour" series={[{ name: "rain", color: "var(--series-1)", points: padRows.filter(s => s.precipMm != null).map(s => [(s.timeMs - launchMs) / 3600e3, s.precipMm!]) }]} yDomain={[0, Math.max(1, ...padRows.map(s => s.precipMm ?? 0)) * 1.2]} yFormat={v => v.toFixed(1)} xFormat={v => (v > 0 ? "+" : "") + v.toFixed(0)} vlines={[{ x: 0, label: "launch" }]} height={160} />
+    <details><summary>Hourly table at the pad ({padRows.length} h)</summary>{rowsTable(padRows, launchMs)}</details>
+    {landRows.length > 0 && <details open><summary>Landing zone {n.landing.lat.toFixed(3)}, {n.landing.lon.toFixed(3)} around touchdown ({landRows.length} h)</summary>{rowsTable(landRows, touchMs)}</details>}
+    <p className="note">Source: {w.label}. Relative humidity and cloud fraction are the model's values on its pressure levels; the surface rows are the model's hourly precipitation (mm in the hour), probability of precipitation where the model provides it, total and layer cloud, 2 m humidity and CAPE. "Time in cloud" uses the pad column for the whole flight, so it is an estimate; the landing-zone rows are the model column nearest the predicted landing point. A CAPE above ~1000 J/kg with rain probability rising means convective showers are possible; the recovery team should read the landing-zone row for the touchdown hour.</p>
   </div>;
 }
 

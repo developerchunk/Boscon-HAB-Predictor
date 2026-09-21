@@ -42,16 +42,25 @@ export const OM_HOSTS = {
 };
 const withKey = (url: string) => (KEY && !SELF ? `${url}&apikey=${encodeURIComponent(KEY)}` : url);
 export class QuotaError extends Error { constructor(msg: string) { super(msg); this.name = "QuotaError"; } }
+const sleepMs = (ms: number, signal?: AbortSignal) => new Promise<void>((res, rej) => { const t = setTimeout(res, ms); signal?.addEventListener("abort", () => { clearTimeout(t); rej(new DOMException("aborted", "AbortError")); }); });
+/**
+ * Fetch with quota handling. A per-MINUTE 429 (a big grid request can use most of a minute's budget)
+ * is waited out and retried, up to ~75 s in total, because the data is worth the wait; an hourly or
+ * daily 429 is reported at once.
+ */
 async function omFetch(url: string, signal?: AbortSignal, what = "Open-Meteo"): Promise<any> {
-  apiStats.requests++;
-  const resp = await fetch(withKey(url), { signal });
-  if (resp.status === 429) {
-    let reason = "rate limit"; try { reason = (await resp.json()).reason ?? reason; } catch { /* ignore */ }
-    apiStats.lastError = reason;
-    throw new QuotaError(`${what}: ${reason} (free tier: 600 calls/min, 5,000/hour, 10,000/day; large requests count as several calls). Cached data from earlier runs is reused automatically; otherwise wait for the next hour.`);
+  for (let attempt = 0; ; attempt++) {
+    apiStats.requests++;
+    const resp = await fetch(withKey(url), { signal });
+    if (resp.status === 429) {
+      let reason = "rate limit"; try { reason = (await resp.json()).reason ?? reason; } catch { /* ignore */ }
+      apiStats.lastError = reason;
+      if (/minute/i.test(reason) && attempt < 3) { await sleepMs(20000 + 5000 * attempt, signal); continue; }
+      throw new QuotaError(`${what}: ${reason} (free tier: 600 calls/min, 5,000/hour, 10,000/day; large requests count as several calls). Cached data from earlier runs is reused automatically; otherwise wait for the next hour.`);
+    }
+    if (!resp.ok) throw new Error(`${what} ${resp.status}: ${(await resp.text()).slice(0, 160)}`);
+    return resp.json();
   }
-  if (!resp.ok) throw new Error(`${what} ${resp.status}: ${(await resp.text()).slice(0, 160)}`);
-  return resp.json();
 }
 const memo = new Map<string, { at: number; value: any }>();
 export async function cached<T>(key: string, ttlMs: number, make: () => Promise<T>): Promise<T> {
@@ -98,6 +107,9 @@ export interface GridFetchResult {
   surfaceElevationM: number;
   generatedAtMs: number;
   model: ModelId;
+  /** filled by the NOMADS bridge (same GRIB files); the Open-Meteo path fetches these separately */
+  weather?: WeatherColumn;
+  surfaceAt?: (lat: number, lon: number) => SurfaceWx[];
 }
 
 function isoHour(d: Date): string { return d.toISOString().slice(0, 13) + ":00"; }
@@ -286,4 +298,71 @@ export async function fetchGfsArchiveProfiles(o: { lat: number; lon: number; mon
     done++; o.onProgress?.(done, jobs.length);
   }
   return out;
+}
+
+/* ------------------------------------------------------------------ humidity, cloud, rain */
+export interface WeatherLevel { p: number; z: number; T: number; rh: number; cloud: number }
+export interface SurfaceWx {
+  /** seconds after the grid epoch is not known here, so absolute ms is used */
+  timeMs: number;
+  precipMm: number | null; precipProb: number | null;
+  cloud: number | null; cloudLow: number | null; cloudMid: number | null; cloudHigh: number | null;
+  rh2m: number | null; dewPoint2m: number | null; cape: number | null; weatherCode: number | null; visibilityM: number | null;
+}
+export interface WeatherColumn { levels: WeatherLevel[]; surface: SurfaceWx[]; label: string }
+
+const SURFACE_VARS = ["precipitation", "precipitation_probability", "cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high", "relative_humidity_2m", "dew_point_2m", "cape", "weather_code", "visibility"];
+function surfaceRows(h: any): SurfaceWx[] {
+  const times: string[] = h.time;
+  const g = (k: string, i: number) => (h[k]?.[i] ?? null);
+  return times.map((t, i) => ({ timeMs: Date.parse(t + "Z"), precipMm: g("precipitation", i), precipProb: g("precipitation_probability", i), cloud: g("cloud_cover", i), cloudLow: g("cloud_cover_low", i), cloudMid: g("cloud_cover_mid", i), cloudHigh: g("cloud_cover_high", i), rh2m: g("relative_humidity_2m", i), dewPoint2m: g("dew_point_2m", i), cape: g("cape", i), weatherCode: g("weather_code", i), visibilityM: g("visibility", i) }));
+}
+
+/**
+ * Relative humidity and cloud cover at every pressure level of the pad column at the launch hour,
+ * plus the surface weather series over the window, from the same model as the winds. One request,
+ * memoised 30 min. For the NOMADS bridge the equivalent comes from the GRIB (see nomads.ts).
+ */
+export async function fetchWeatherColumn(o: { lat: number; lon: number; model: Exclude<ModelId, "nomads_gfs025">; launch: Date; hoursBefore?: number; hoursAfter?: number; signal?: AbortSignal }): Promise<WeatherColumn> {
+  const start = new Date(o.launch.getTime() - (o.hoursBefore ?? 4) * 3600e3), end = new Date(o.launch.getTime() + (o.hoursAfter ?? 11) * 3600e3);
+  const key = `wx|${o.model}|${o.lat.toFixed(3)},${o.lon.toFixed(3)}|${isoHour(start)}|${isoHour(end)}`;
+  return cached(key, 30 * 60e3, async () => {
+    const levels = MODEL_LEVELS[o.model];
+    const vars = [...SURFACE_VARS];
+    for (const p of levels) vars.push(`relative_humidity_${p}hPa`, `cloud_cover_${p}hPa`, `geopotential_height_${p}hPa`, `temperature_${p}hPa`);
+    const url = `${OM_HOSTS.forecast}?latitude=${o.lat}&longitude=${o.lon}&hourly=${vars.join(",")}&models=${o.model}&timezone=UTC&start_hour=${isoHour(start)}&end_hour=${isoHour(end)}`;
+    const d = await omFetch(url, o.signal, "Open-Meteo weather column");
+    const h = d.hourly; const times: string[] = h.time;
+    let li = times.findIndex(t => Date.parse(t + "Z") >= o.launch.getTime()); if (li < 0) li = times.length - 1;
+    const lv: WeatherLevel[] = [];
+    for (const p of levels) {
+      const z = h[`geopotential_height_${p}hPa`]?.[li], rh = h[`relative_humidity_${p}hPa`]?.[li], cc = h[`cloud_cover_${p}hPa`]?.[li], T = h[`temperature_${p}hPa`]?.[li];
+      if (z == null || rh == null || T == null) continue;
+      if (z < (d.elevation ?? 0) - 50) continue;
+      lv.push({ p: p * 100, z, T: T + 273.15, rh, cloud: cc ?? 0 });
+    }
+    lv.sort((a, b) => a.z - b.z);
+    return { levels: lv, surface: surfaceRows(h), label: `${MODEL_LABEL[o.model]}, ${times[li]}Z` };
+  });
+}
+
+/** Surface weather series at any point (e.g. the landing zone), same model. */
+export async function fetchSurfaceWeather(o: { lat: number; lon: number; model: Exclude<ModelId, "nomads_gfs025">; launch: Date; hoursBefore?: number; hoursAfter?: number; signal?: AbortSignal }): Promise<SurfaceWx[]> {
+  const start = new Date(o.launch.getTime() - (o.hoursBefore ?? 1) * 3600e3), end = new Date(o.launch.getTime() + (o.hoursAfter ?? 6) * 3600e3);
+  const key = `sfc|${o.model}|${o.lat.toFixed(2)},${o.lon.toFixed(2)}|${isoHour(start)}|${isoHour(end)}`;
+  return cached(key, 30 * 60e3, async () => {
+    const url = `${OM_HOSTS.forecast}?latitude=${o.lat}&longitude=${o.lon}&hourly=${SURFACE_VARS.join(",")}&models=${o.model}&timezone=UTC&start_hour=${isoHour(start)}&end_hour=${isoHour(end)}`;
+    const d = await omFetch(url, o.signal, "Open-Meteo surface weather");
+    return surfaceRows(d.hourly);
+  });
+}
+
+/** WMO weather interpretation codes (as used by Open-Meteo) -> words. */
+export function weatherCodeText(c: number | null): string {
+  if (c == null) return "–";
+  if (c === 0) return "clear"; if (c === 1) return "mainly clear"; if (c === 2) return "partly cloudy"; if (c === 3) return "overcast";
+  if (c === 45 || c === 48) return "fog"; if (c >= 51 && c <= 57) return "drizzle"; if (c >= 61 && c <= 67) return "rain";
+  if (c >= 71 && c <= 77) return "snow"; if (c >= 80 && c <= 82) return "rain showers"; if (c === 85 || c === 86) return "snow showers";
+  if (c === 95) return "thunderstorm"; if (c === 96 || c === 99) return "thunderstorm with hail";
+  return `code ${c}`;
 }

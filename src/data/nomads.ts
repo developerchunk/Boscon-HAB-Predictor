@@ -6,7 +6,7 @@
  * before the data reaches the integrator.
  */
 import { GridWindField, type GridColumn, type GridColumnLevel } from "../physics/wind";
-import { cached, type FetchGridOptions, type GridFetchResult } from "./openmeteo";
+import { cached, type FetchGridOptions, type GridFetchResult, type WeatherColumn, type SurfaceWx } from "./openmeteo";
 
 export const NOMADS_BRIDGE = ((import.meta.env.VITE_NOMADS_BRIDGE as string | undefined)?.trim() || "http://localhost:8787").replace(/\/$/, "");
 export const NOMADS_MODEL_ID = "nomads_gfs025" as const;
@@ -40,6 +40,10 @@ export async function fetchNomadsGrid(o: FetchGridOptions): Promise<GridFetchRes
     let ci = 0, best = Infinity;
     columns.forEach((c, i) => { const dd = Math.hypot(c.lat - o.lat, (c.lon - o.lon) * Math.cos((o.lat * Math.PI) / 180)); if (dd < best) { best = dd; ci = i; } });
     const li = Math.max(0, timesS.findIndex(t => epochMs + t * 1000 >= o.launch.getTime()));
-    return { field, epochMs, lats: [...new Set(columns.map(c => c.lat))].sort((a, b) => a - b), lons: [...new Set(columns.map(c => c.lon))].sort((a, b) => a - b), launchColumn: columns[ci].times[li], surfaceElevationM: d.columns[ci].elevation ?? 0, generatedAtMs: Date.now(), model: NOMADS_MODEL_ID };
+    const nearest = (lat: number, lon: number) => { let bi = 0, bd = Infinity; d.columns.forEach((c: any, i: number) => { const dd = Math.hypot(c.lat - lat, (c.lon - lon) * Math.cos((lat * Math.PI) / 180)); if (dd < bd) { bd = dd; bi = i; } }); return bi; };
+    const surfaceOf = (c: any): SurfaceWx[] => (c.sfc ?? []).map((s: any, i: number) => ({ timeMs: epochMs + timesS[i] * 1000, precipMm: s.precipMmH, precipProb: null, cloud: s.cloud, cloudLow: null, cloudMid: null, cloudHigh: null, rh2m: s.rh2m, dewPoint2m: null, cape: s.cape, weatherCode: null, visibilityM: null }));
+    const wxLevels = (d.columns[ci].times[li] as any[]).filter(q => q.rh != null).map(q => ({ p: q.p, z: q.z, T: q.T, rh: q.rh, cloud: q.cc ?? 0 }));
+    const weather: WeatherColumn = { levels: wxLevels, surface: surfaceOf(d.columns[ci]), label: `${d.source.split(",")[0]}, ${times[li]}Z` };
+    return { field, epochMs, lats: [...new Set(columns.map(c => c.lat))].sort((a, b) => a - b), lons: [...new Set(columns.map(c => c.lon))].sort((a, b) => a - b), launchColumn: columns[ci].times[li], surfaceElevationM: d.columns[ci].elevation ?? 0, generatedAtMs: Date.now(), model: NOMADS_MODEL_ID, weather, surfaceAt: (lat, lon) => surfaceOf(d.columns[nearest(lat, lon)]) };
   });
 }

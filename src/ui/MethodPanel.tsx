@@ -8,6 +8,8 @@ export function MethodPanel() {
 
     <p><b>Temperature.</b> The "Projected air temperature" card and the 3-D labels use the same model temperatures at pressure levels that build the density column, interpolated linearly in height; the ISA is drawn only as a reference. Cold-exposure minutes are counted along the nominal trajectory at its own position and time. They are free-air values, not payload-box temperatures.</p>
 
+    <p><b>Humidity, cloud and rain.</b> Relative humidity and cloud fraction on the model's pressure levels (pad column, launch hour), and the hourly surface precipitation, probability, cloud layers, 2 m humidity and CAPE at the pad and at the predicted landing point, all from the model that supplies the winds (from the GRIB itself with the bridge). Cloud bands, icing-risk bands (RH ≥ 90% between 0 and −20 °C) and time in cloud are derived from the pad column along the nominal flight and are estimates.</p>
+
     <h3>2. Fill and ascent</h3>
     <pre>{`Neck lift (what the spring scale reads with the payload detached):  L_neck = V0 (ρ_air − ρ_gas) − m_balloon
 Free lift:                                                             L_free = L_neck − m_under_balloon
