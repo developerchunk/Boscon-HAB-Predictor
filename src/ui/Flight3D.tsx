@@ -207,7 +207,8 @@ export function Flight3D({ data, launchLat, launchLon, launchAltM }: { data: Fli
     const padY = Y(launchAltM);
     const axisTop = Y(Math.max(35000, data.nominal.burst.z + 3000));
     g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, padY, 0), new THREE.Vector3(0, axisTop, 0)]), new THREE.LineBasicMaterial({ color: 0x888888 })));
-    for (let a = 5000; a <= 35000; a += 5000) { const tick = label(`${a / 1000} km`, "l3d muted"); tick.position.set(0, Y(a), 0); g.add(tick); g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-0.8, Y(a), 0), new THREE.Vector3(0.8, Y(a), 0)]), new THREE.LineBasicMaterial({ color: 0x888888 }))); }
+    const padAtmos = data.grid.field.atmosphere(launchLat, launchLon, data.nominal.points[0]?.t ?? 0);
+    for (let a = 5000; a <= 35000; a += 5000) { const st = padAtmos.state(a); const tick = label(`${a / 1000} km · ${(st.T - 273.15).toFixed(0)} °C · ${(st.p / 100).toFixed(st.p < 10000 ? 1 : 0)} hPa`, "l3d muted"); tick.position.set(0, Y(a), 0); g.add(tick); g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-0.8, Y(a), 0), new THREE.Vector3(0.8, Y(a), 0)]), new THREE.LineBasicMaterial({ color: 0x888888 }))); }
     // wind column above the pad (forecast at launch hour)
     if (showColumn) {
       let lastZ = -1e9;
@@ -280,7 +281,10 @@ export function Flight3D({ data, launchLat, launchLon, launchAltM }: { data: Fli
     env.scale.setScalar(descending ? 1 : Math.min(4.5, grow));
     ch.scale.setScalar(2.2);
     const el = t.balloonLabel.element as HTMLDivElement;
-    el.textContent = `${descending ? "⬇ under parachute" : "⬆ balloon Ø×" + Math.min(4.5, grow).toFixed(1)} · T+${hhmm(tSec)} · ${(z / 1000).toFixed(1)} km · ${(Math.hypot(x, zz)).toFixed(1)} km out`;
+    const st = data.grid.field.atmosphere(lat, lon, target).state(z);
+    const tempC = st.T - 273.15, hPa = st.p / 100;
+    el.textContent = `${descending ? "⬇ under parachute" : "⬆ balloon Ø×" + Math.min(4.5, grow).toFixed(1)} · T+${hhmm(tSec)} · ${(z / 1000).toFixed(1)} km · ${(Math.hypot(x, zz)).toFixed(1)} km out · ${tempC.toFixed(0)} °C · ${hPa.toFixed(hPa < 100 ? 1 : 0)} hPa`;
+    el.style.color = tempC <= -40 ? "#6ea8ff" : tempC <= 0 ? "#9cc4ff" : "";
     t.balloonLabel.position.set(0, descending ? 3 : Math.min(4.5, grow) + 1, 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tSec, data, exag]);
@@ -326,6 +330,6 @@ export function Flight3D({ data, launchLat, launchLon, launchAltM }: { data: Fli
       <span className="status">{terrainStatus}</span>
     </div>
     <div ref={host} style={{ position: "relative", minHeight: 420, border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden", background: "var(--surface-2)" }} />
-    <p className="note" style={{ margin: 0 }}>Drag to orbit, scroll to zoom, right-drag to pan. Map orientation: NORTH, SOUTH, EAST and WEST are written on the edges of the terrain and a cross at the pad points north; altitude is up with the chosen exaggeration; the tick marks on the pad axis are 5 km apart. Press play: the balloon icon climbs the blue tube and swells as the air thins (its label shows the diameter growth), then falls under the orange parachute. Yellow arrows: wind at the balloon's own position (0.3 km of arrow per m/s); green arrows: the forecast wind column above the pad at launch hour, which shows why the track turns where it does. Blue tube ascent, orange tube descent, grey line its shadow on the ground, purple dots the Monte Carlo landings.</p>
+    <p className="note" style={{ margin: 0 }}>Drag to orbit, scroll to zoom, right-drag to pan. Map orientation: NORTH, SOUTH, EAST and WEST are written on the edges of the terrain and a cross at the pad points north; altitude is up with the chosen exaggeration; the tick marks on the pad axis are 5 km apart. Press play: the balloon icon climbs the blue tube and swells as the air thins; its label shows the diameter growth, position, and the forecast air temperature and pressure at that height (blue text below 0 °C), then it falls under the orange parachute. The altitude ticks on the pad axis carry the pad column's temperature. Yellow arrows: wind at the balloon's own position (0.3 km of arrow per m/s); green arrows: the forecast wind column above the pad at launch hour, which shows why the track turns where it does. Blue tube ascent, orange tube descent, grey line its shadow on the ground, purple dots the Monte Carlo landings.</p>
   </div>;
 }

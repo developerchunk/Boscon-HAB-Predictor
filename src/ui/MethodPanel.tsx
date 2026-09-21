@@ -6,6 +6,8 @@ export function MethodPanel() {
     <h3>1. Atmosphere</h3>
     <p>US Standard Atmosphere 1976, seven layers to 86 km, with geometric↔geopotential conversion (r₀ = 6356.766 km). Verified against the published layer-base pressures (22632.06 Pa at 11 km, 5474.889 Pa at 20 km, 868.0187 Pa at 32 km, 110.9063 Pa at 47 km) to 0.05%. For a live prediction the density column is built from the forecast's own temperature and geopotential height at every pressure level (ρ = p/RT, hydrostatic between levels), so the ascent and the parachute see the real tropical atmosphere, which at 30 km is warmer and ~10% denser than the ISA. Air viscosity from Sutherland's law (USSA76 eq. 51).</p>
 
+    <p><b>Temperature.</b> The "Projected air temperature" card and the 3-D labels use the same model temperatures at pressure levels that build the density column, interpolated linearly in height; the ISA is drawn only as a reference. Cold-exposure minutes are counted along the nominal trajectory at its own position and time. They are free-air values, not payload-box temperatures.</p>
+
     <h3>2. Fill and ascent</h3>
     <pre>{`Neck lift (what the spring scale reads with the payload detached):  L_neck = V0 (ρ_air − ρ_gas) − m_balloon
 Free lift:                                                             L_free = L_neck − m_under_balloon

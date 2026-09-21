@@ -11,6 +11,7 @@ import { planFill, buildFlightConfig, flyWithTerrain, type PredictInputs } from 
 import { flyTrajectory, type FlightResult } from "./physics/trajectory";
 import { ellipsePolygon, type McResult } from "./physics/montecarlo";
 import { eastNorthM, distanceM, bearingDeg, dirSpeedFromUV } from "./physics/geo";
+import { isa } from "./physics/atmosphere";
 import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, geocode, apiStats, OM_HOSTS, MODEL_LABEL, type ModelId, type GridFetchResult, type GeocodeHit } from "./data/openmeteo";
 import { fetchTawhiri, type TawhiriResult } from "./data/tawhiri";
 import { bridgeOnline, NOMADS_BRIDGE } from "./data/nomads";
@@ -296,10 +297,56 @@ function ResultCharts({ r, inp }: { r: Results; inp: PredictInputs }) {
       <div className="legend"><span><span className="sw" style={{ background: "var(--series-1)" }} />east–west</span><span><span className="sw" style={{ background: "var(--series-3)" }} />north–south</span></div>
       <LayerBars layers={n.layers} />
       <LayerTable layers={n.layers} /></div>
+    <TemperatureCard r={r} />
     {asc.length > 0 && <div className="card"><h3>Ascent rate profile used ({inp.ascentModel})</h3>
       <LineChart xLabel="ascent rate, m/s" yLabel="altitude, km" series={[{ name: "v", color: "var(--series-1)", points: asc.map(t => [t.v, t.z / 1000]) }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(1)} xDomain={[0, Math.max(...asc.map(t => t.v)) * 1.1]} height={220} />
       <p className="note">Cd curve scale factor {n.ascentModel!.cdScale.toFixed(2)} to hit {r.plan.padAscentMs.toFixed(2)} m/s at the pad.</p></div>}
   </>;
+}
+
+/**
+ * Projected air temperature: the forecast model's temperature at each pressure level in the pad
+ * column at launch hour (same data the density column uses), and the temperature at the balloon's
+ * own position and time along the flight (nearest grid column and hour), against the ISA reference.
+ */
+function TemperatureCard({ r }: { r: Results }) {
+  const n = r.nominal;
+  const col = r.grid.launchColumn;
+  const profile = col.map(l => [l.T - 273.15, l.z / 1000] as [number, number]);
+  const zTop = Math.max(35, n.burst.z / 1000 + 2);
+  const isaRef: [number, number][] = []; for (let z = 0; z <= zTop * 1000; z += 500) isaRef.push([isa(z).T - 273.15, z / 1000]);
+  const step = Math.max(1, Math.floor(n.points.length / 400));
+  const along: { t: number; z: number; T: number; stage: string }[] = [];
+  for (let i = 0; i < n.points.length; i += step) { const q = n.points[i]; along.push({ t: (q.t - n.points[0].t) / 60, z: q.z, T: r.grid.field.atmosphere(q.lat, q.lon, q.t).state(q.z).T - 273.15, stage: q.stage }); }
+  const last = n.points[n.points.length - 1]; along.push({ t: (last.t - n.points[0].t) / 60, z: last.z, T: r.grid.field.atmosphere(last.lat, last.lon, last.t).state(last.z).T - 273.15, stage: last.stage });
+  const coldest = along.reduce((a, b) => (b.T < a.T ? b : a), along[0]);
+  const dtMin = along.length > 1 ? along[1].t - along[0].t : 0;
+  const below = (thr: number) => along.filter(q => q.T <= thr).length * dtMin;
+  const padT = along[0].T, burstT = along.find(q => q.stage === "descent")?.T ?? along[along.length - 1].T;
+  const tropo = col.reduce((a, b) => (b.T < a.T ? b : a), col[0]);
+  const xLo = Math.min(-90, ...profile.map(q => q[0])) - 5, xHi = Math.max(40, ...profile.map(q => q[0])) + 5;
+  const padAtmos = r.grid.field.atmosphere(n.points[0].lat, n.points[0].lon, n.points[0].t);
+  const pBurst = r.grid.field.atmosphere(n.burst.lat, n.burst.lon, n.points[0].t + n.burst.t).state(n.burst.z).p / 100;
+  const pPad = padAtmos.state(n.points[0].z).p / 100;
+  return <div className="card"><h3>Projected air temperature and pressure</h3>
+    <div className="kv">
+      <span className="k">At the pad · at burst</span><span className="v">{padT.toFixed(0)} °C, {pPad.toFixed(0)} hPa · {burstT.toFixed(0)} °C, {pBurst.toFixed(1)} hPa</span>
+      <span className="k">Coldest point of the flight</span><span className="v big">{coldest.T.toFixed(0)} °C at {(coldest.z / 1000).toFixed(1)} km, T+{coldest.t.toFixed(0)} min</span>
+      <span className="k">Tropopause in the pad column</span><span className="v">{(tropo.T - 273.15).toFixed(0)} °C at {(tropo.z / 1000).toFixed(1)} km</span>
+      <span className="k">Time at or below −20 / −40 / −60 °C</span><span className="v">{below(-20).toFixed(0)} / {below(-40).toFixed(0)} / {below(-60).toFixed(0)} min</span>
+    </div>
+    <div className="legend" style={{ marginTop: 6 }}><span><span className="sw" style={{ background: "var(--series-2)" }} />forecast, pad column at launch hour</span><span><span className="sw" style={{ background: "var(--ref)" }} />ISA reference (dashed)</span></div>
+    <LineChart xLabel="air temperature, °C" yLabel="altitude, km" series={[{ name: "forecast", color: "var(--series-2)", points: profile }, { name: "ISA", color: "var(--ref)", dashed: true, points: isaRef }]} xDomain={[xLo, xHi]} yDomain={[0, zTop]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} vlines={[{ x: 0, label: "0 °C" }, { x: -40, label: "−40" }]} hlines={[{ y: n.burst.z / 1000, label: "burst" }]} tooltip={(x, y, s) => <span>{s.name}: {x.toFixed(1)} °C at {y.toFixed(1)} km</span>} />
+    <div className="legend" style={{ marginTop: 6 }}><span><span className="sw" style={{ background: "var(--ascent)" }} />ascent</span><span><span className="sw" style={{ background: "var(--descent)" }} />descent</span></div>
+    <LineChart xLabel="minutes after launch" yLabel="temperature at the balloon, °C" series={[{ name: "ascent", color: "var(--ascent)", points: along.filter(q => q.stage !== "descent").map(q => [q.t, q.T]) }, { name: "descent", color: "var(--descent)", points: along.filter(q => q.stage === "descent").map(q => [q.t, q.T]) }]} yFormat={v => v.toFixed(0)} xFormat={v => v.toFixed(0)} hlines={[{ y: -40, label: "−40 °C" }]} height={220} tooltip={(x, y, s) => <span>{s.name}: {y.toFixed(1)} °C at T+{x.toFixed(0)} min</span>} />
+    <details><summary>Pad column at launch hour: pressure level, height, temperature, wind ({col.length} levels)</summary>
+      <table className="t"><thead><tr><th>pressure hPa</th><th>height m</th><th>temp °C</th><th>wind m/s</th><th>from</th><th>pushes toward</th></tr></thead><tbody>
+        {[...col].reverse().map((l, i) => { const [from, spd] = dirSpeedFromUV(l.u, l.v); return <tr key={i}><td>{(l.p / 100).toFixed(l.p < 10000 ? 1 : 0)}</td><td>{l.z.toFixed(0)}</td><td>{(l.T - 273.15).toFixed(1)}</td><td>{spd.toFixed(1)}</td><td>{deg(from)} {compass(from)}</td><td>{compass(from + 180)}</td></tr>; })}
+      </tbody></table>
+      <p className="note">Rows are the model's own pressure levels, top of the atmosphere first. The last few rows are the 10–180 m above-ground winds; their pressure is derived hydrostatically from the surface pressure. Height is the model's geopotential height for that level, which is what the balloon's altitude is matched against.</p>
+    </details>
+    <p className="note">Source: the forecast model's temperature at each pressure level ({r.grid.field.label.split(",")[0]}), interpolated linearly between levels — the same column the ascent and descent use for air density. These are free-air temperatures; the payload box will run warmer in sunlight and cooler in shade, and the batteries' own self-heating is not included. The tropics have a colder, higher tropopause than the ISA, which is why the forecast line bends well below the dashed one near 17 km.</p>
+  </div>;
 }
 
 /** metres east/north -> "6.0 W / 1.7 N" (km, compass letters instead of signs; 0.0 shown without a letter) */
