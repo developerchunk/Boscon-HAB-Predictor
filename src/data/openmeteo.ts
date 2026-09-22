@@ -63,6 +63,11 @@ async function omFetch(url: string, signal?: AbortSignal, what = "Open-Meteo"): 
   }
 }
 const memo = new Map<string, { at: number; value: any }>();
+/** What the in-memory response cache holds (this page load only); `bytes` is the JSON length of the stored value. */
+export function cacheEntries(): { key: string; at: number; bytes: number }[] {
+  return [...memo.entries()].map(([key, v]) => { let bytes = 0; try { bytes = JSON.stringify(v.value).length; } catch { /* ignore */ } return { key, at: v.at, bytes }; });
+}
+export function clearCache(keys?: string[]): void { if (!keys) memo.clear(); else for (const k of keys) memo.delete(k); }
 export async function cached<T>(key: string, ttlMs: number, make: () => Promise<T>): Promise<T> {
   const hit = memo.get(key);
   if (hit && Date.now() - hit.at < ttlMs) { apiStats.cacheHits++; return hit.value as T; }
@@ -259,44 +264,53 @@ export async function geocode(q: string, count = 8, signal?: AbortSignal): Promi
  * (0.1 m/s ints) from 0 m AMSL plus the [z, T, p] column, for the requested UTC hours only.
  */
 export interface ArchiveProfile { d: string; h: number; uv: [number, number][]; col: [number, number, number][] }
+/** Raw Open-Meteo historical-forecast month: hourly time stamps and the per-level arrays, exactly as returned. */
+export interface ArchiveMonth { time: string[]; vars: Record<string, (number | null)[]> }
+export const ARCHIVE_FIRST_YM = "2021-04"; // the Open-Meteo historical-forecast archive (previous runs) starts in April 2021
+const archiveVars = () => { const v: string[] = []; for (const p of MODEL_LEVELS.gfs_seamless) v.push(`wind_speed_${p}hPa`, `wind_direction_${p}hPa`, `geopotential_height_${p}hPa`, `temperature_${p}hPa`); return v; };
+/** One request: every hour of one calendar month at one point, all 23 GFS levels (wind, height, temperature). */
+export async function fetchArchiveMonth(o: { lat: number; lon: number; y: number; mo: number; signal?: AbortSignal }): Promise<ArchiveMonth> {
+  const last = new Date(Date.UTC(o.y, o.mo, 0)).getUTCDate();
+  const url = `${OM_HOSTS.archive}?latitude=${o.lat}&longitude=${o.lon}&start_date=${o.y}-${String(o.mo).padStart(2, "0")}-01&end_date=${o.y}-${String(o.mo).padStart(2, "0")}-${last}&hourly=${archiveVars().join(",")}&models=gfs_seamless&wind_speed_unit=ms&timezone=UTC`;
+  const d = await cached(`arch|${o.lat.toFixed(2)},${o.lon.toFixed(2)}|${o.y}-${o.mo}`, 24 * 3600e3, () => omFetch(url, o.signal, "Open-Meteo archive"));
+  const h = d.hourly ?? {}; const vars: Record<string, (number | null)[]> = {};
+  for (const k of archiveVars()) if (h[k]) vars[k] = h[k];
+  return { time: h.time ?? [], vars };
+}
+/** Turn a raw month into 250 m wind profiles (+ temperature column) at the wanted UTC hours; same output as the bundled Jejuri archive. */
+export function archiveMonthToProfiles(m: ArchiveMonth, hoursUtc: number[]): ArchiveProfile[] {
+  const levels = MODEL_LEVELS.gfs_seamless, out: ArchiveProfile[] = [];
+  for (let i = 0; i < m.time.length; i++) {
+    if (!hoursUtc.includes(+m.time[i].slice(11, 13))) continue;
+    const lv: { z: number; u: number; v: number; T: number; p: number }[] = [];
+    for (const pl of levels) {
+      const z = m.vars[`geopotential_height_${pl}hPa`]?.[i], ws = m.vars[`wind_speed_${pl}hPa`]?.[i], wd = m.vars[`wind_direction_${pl}hPa`]?.[i], T = m.vars[`temperature_${pl}hPa`]?.[i];
+      if (z == null || ws == null || wd == null || T == null) continue;
+      const [u, v] = uvFromDirSpeed(wd, ws);
+      lv.push({ z, u, v, T: T + 273.15, p: pl * 100 });
+    }
+    lv.sort((a, b) => a.z - b.z);
+    if (lv.length < 15 || lv[lv.length - 1].z < 30000) continue;
+    const uv: [number, number][] = [];
+    let j = 0;
+    for (let z = 0; z <= lv[lv.length - 1].z; z += 250) {
+      let u: number, v: number;
+      if (z <= lv[0].z) { u = lv[0].u; v = lv[0].v; }
+      else { while (j < lv.length - 2 && lv[j + 1].z < z) j++; const a = lv[j], b = lv[j + 1]; const f = b.z > a.z ? (z - a.z) / (b.z - a.z) : 0; u = a.u + f * (b.u - a.u); v = a.v + f * (b.v - a.v); }
+      uv.push([Math.round(u * 10), Math.round(v * 10)]);
+    }
+    out.push({ d: m.time[i].slice(0, 10), h: +m.time[i].slice(11, 13), uv, col: lv.map(l => [Math.round(l.z), Math.round(l.T * 10), Math.round(l.p)]) });
+  }
+  return out;
+}
 export async function fetchGfsArchiveProfiles(o: { lat: number; lon: number; months: number[]; years: number[]; hoursUtc: number[]; signal?: AbortSignal; onProgress?: (done: number, total: number) => void }): Promise<ArchiveProfile[]> {
-  const levels = MODEL_LEVELS.gfs_seamless;
-  const vars: string[] = [];
-  for (const p of levels) vars.push(`wind_speed_${p}hPa`, `wind_direction_${p}hPa`, `geopotential_height_${p}hPa`, `temperature_${p}hPa`);
   const jobs: [number, number][] = [];
   const today = new Date();
   for (const y of o.years) for (const mo of o.months) { if (y > today.getUTCFullYear() || (y === today.getUTCFullYear() && mo > today.getUTCMonth() + 1)) continue; if (y < 2021 || (y === 2021 && mo < 4)) continue; jobs.push([y, mo]); }
   const out: ArchiveProfile[] = [];
   let done = 0;
   o.onProgress?.(0, jobs.length);
-  for (const [y, mo] of jobs) {
-    const last = new Date(Date.UTC(y, mo, 0)).getUTCDate();
-    const url = `${OM_HOSTS.archive}?latitude=${o.lat}&longitude=${o.lon}&start_date=${y}-${String(mo).padStart(2, "0")}-01&end_date=${y}-${String(mo).padStart(2, "0")}-${last}&hourly=${vars.join(",")}&models=gfs_seamless&wind_speed_unit=ms&timezone=UTC`;
-    const d = await cached(`arch|${o.lat.toFixed(2)},${o.lon.toFixed(2)}|${y}-${mo}`, 24 * 3600e3, () => omFetch(url, o.signal, "Open-Meteo archive"));
-    const h = d.hourly; const times: string[] = h.time;
-    for (let i = 0; i < times.length; i++) {
-      if (!o.hoursUtc.includes(+times[i].slice(11, 13))) continue;
-      const lv: { z: number; u: number; v: number; T: number; p: number }[] = [];
-      for (const pl of levels) {
-        const z = h[`geopotential_height_${pl}hPa`]?.[i], ws = h[`wind_speed_${pl}hPa`]?.[i], wd = h[`wind_direction_${pl}hPa`]?.[i], T = h[`temperature_${pl}hPa`]?.[i];
-        if (z == null || ws == null || wd == null || T == null) continue;
-        const [u, v] = uvFromDirSpeed(wd, ws);
-        lv.push({ z, u, v, T: T + 273.15, p: pl * 100 });
-      }
-      lv.sort((a, b) => a.z - b.z);
-      if (lv.length < 15 || lv[lv.length - 1].z < 30000) continue;
-      const uv: [number, number][] = [];
-      let j = 0;
-      for (let z = 0; z <= lv[lv.length - 1].z; z += 250) {
-        let u: number, v: number;
-        if (z <= lv[0].z) { u = lv[0].u; v = lv[0].v; }
-        else { while (j < lv.length - 2 && lv[j + 1].z < z) j++; const a = lv[j], b = lv[j + 1]; const f = b.z > a.z ? (z - a.z) / (b.z - a.z) : 0; u = a.u + f * (b.u - a.u); v = a.v + f * (b.v - a.v); }
-        uv.push([Math.round(u * 10), Math.round(v * 10)]);
-      }
-      out.push({ d: times[i].slice(0, 10), h: +times[i].slice(11, 13), uv, col: lv.map(l => [Math.round(l.z), Math.round(l.T * 10), Math.round(l.p)]) });
-    }
-    done++; o.onProgress?.(done, jobs.length);
-  }
+  for (const [y, mo] of jobs) { out.push(...archiveMonthToProfiles(await fetchArchiveMonth({ lat: o.lat, lon: o.lon, y, mo, signal: o.signal }), o.hoursUtc)); done++; o.onProgress?.(done, jobs.length); }
   return out;
 }
 

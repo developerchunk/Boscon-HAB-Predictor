@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MapView, type MapData } from "./ui/MapView";
 import { BurstCalcPanel } from "./ui/BurstCalcPanel";
 import { ClimatologyPanel } from "./ui/ClimatologyPanel";
+import { StoragePanel } from "./ui/StoragePanel";
 import { MethodPanel } from "./ui/MethodPanel";
 import { Flight3D } from "./ui/Flight3D";
 import { SavedPanel } from "./ui/SavedPanel";
@@ -20,7 +21,7 @@ import { fetchTawhiri } from "./data/tawhiri";
 import { bridgeOnline, NOMADS_BRIDGE } from "./data/nomads";
 import { callWorker } from "./ui/worker-client";
 
-type Tab = "predict" | "flight3d" | "burst" | "climatology" | "saved" | "method";
+type Tab = "predict" | "flight3d" | "burst" | "climatology" | "saved" | "storage" | "method";
 
 import { DEFAULT_INPUTS } from "./physics/defaults";
 export default function App() {
@@ -176,13 +177,14 @@ export default function App() {
   return <div className="app">
     <div className="topbar">
       <h1>BOSCON HAB predictor</h1><span className="note">landing prediction · burst calculator · Pune wind climatology</span>
-      <div className="tabs">{(["predict", "flight3d", "burst", "climatology", "saved", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", flight3d: "3-D flight", burst: "Burst calculator", climatology: "Climatology", saved: "Saved", method: "Method & sources" }[t]}</button>)}</div>
+      <div className="tabs">{(["predict", "flight3d", "burst", "climatology", "saved", "storage", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", flight3d: "3-D flight", burst: "Burst calculator", climatology: "Climatology", saved: "Saved", storage: "Storage", method: "Method & sources" }[t]}</button>)}</div>
     </div>
     {tab === "flight3d" && <Flight3D key={"f" + loadKey} data={res ? { nominal: res.nominal, mc: res.mc, tawhiri: res.tawhiri, grid: res.grid, weather: res.weather } : null} launchLat={inp.launchLat} launchLon={inp.launchLon} launchAltM={inp.launchAltM} initial={initialTabs.flight3d} onSnapshot={s => { tabs.current.flight3d = s; scheduleResave(); }} />}
     {tab === "burst" && <BurstCalcPanel key={"b" + loadKey} siteAltM={inp.launchAltM} initial={initialTabs.burstCalc} onSnapshot={s => { tabs.current.burstCalc = s; scheduleResave(); }} />}
+    {tab === "storage" && <StoragePanel currentId={currentId} onPredictionsDeleted={ids => { if (currentId && ids.includes(currentId)) setCurrentId(null); setSavedVersion(v => v + 1); }} />}
     {tab === "saved" && <SavedPanel version={savedVersion} currentId={currentId} onLoad={loadSaved} onSaveCurrent={n => saveCurrent(n)} hasCurrent={!!res} suggestedName={suggestedName()} />}
     {tab === "method" && <MethodPanel />}
-    {tab === "climatology" && <ClimatologyPanel key={"c" + loadKey} inputs={inp} initial={initialTabs.climatology} onSnapshot={s => { tabs.current.climatology = s; scheduleResave(); }} />}
+    {tab === "climatology" && <ClimatologyPanel key={"c" + loadKey} inputs={inp} placeName={placeQuery} initial={initialTabs.climatology} onSnapshot={s => { tabs.current.climatology = s; scheduleResave(); }} />}
     {tab === "predict" && <div className="main">
       <div className="sidebar">
         <h2>Launch</h2>

@@ -40,7 +40,10 @@ Burst:                                                                  D(z) ≥
     <h3>7. Saved predictions</h3>
     <p>Each completed run is stored in this browser (IndexedDB) with its inputs, settings, the whole wind grid, flight, Monte Carlo, Tawhiri and weather, plus the burst-calculator, climatology and 3-D-view state, so loading it later needs no network. The Saved tab downloads a record as a <code>.habpred.json</code> file, imports one, or deletes the browser copy. Records live in one browser profile and one site address; move them between machines with Download and Import.</p>
 
-    <h3>8. What is not done, and known limits</h3>
+    <h3>8. GFS archive for any pad, and the Storage tab</h3>
+    <p>The bundled climatology is for the Pune region and the Jejuri pad. For any other pad the Climatology tab downloads the Open-Meteo GFS archive at the pad, one request per calendar month (about 350 kB and 3–17 s each, measured 2026-09-22), stored raw in this browser so any months, date window, years or launch hour can be used offline afterwards; a progress bar shows months, bytes, elapsed and remaining time, Cancel stops it, and Download resumes it (stored months are skipped). The full archive from April 2021 is 66 months, about 23 MB and about 12 minutes at the measured 11 s per month. The Storage tab lists everything kept in the browser (saved predictions, archives and their months, settings, this page's in-memory caches) with single, multi-select and delete-all.</p>
+
+    <h3>9. What is not done, and known limits</h3>
     <ul>
       <li>No forecast is reliable beyond ~7 days (Akerman, Wyoming Space Grant: night-before SondeHub predictions land within 8 km ~70% of the time). GFS reaches 16 days; the climatology is for planning beyond that.</li>
       <li>The ECMWF ensemble has only 14 levels, three of them in the stratosphere; its spread above 20 km is coarse.</li>

@@ -26,6 +26,9 @@ function loadTile(z: number, x: number, y: number): Promise<Uint8ClampedArray> {
 }
 
 export const terrainRgbAvailable = () => !!TOKEN && TOKEN.startsWith("pk.");
+/** Decoded tiles held in memory: each is 256×256 RGBA = 262,144 bytes. */
+export const tileCacheStats = () => ({ count: tileCache.size, bytes: tileCache.size * T * T * 4 });
+export const clearTileCache = () => { tileCache.clear(); };
 
 /** Elevations (m) for points [lat, lon] at zoom 14 (~9 m per pixel here). Throws if no public token. */
 export async function elevationsFromTerrainRgb(points: [number, number][], z = 14): Promise<number[]> {

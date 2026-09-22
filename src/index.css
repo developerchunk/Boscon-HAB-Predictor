@@ -97,3 +97,7 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; margin
 .l3d.cardinal { font-size: 13px; font-weight: 700; letter-spacing: 0.08em; color: var(--text); background: color-mix(in srgb, var(--surface) 85%, transparent); padding: 2px 8px; border-radius: 4px; }
 .mapwrap:fullscreen, .mapwrap.expanded { background: var(--bg); }
 .mapwrap.expanded { position: fixed; inset: 0; z-index: 50; }
+.progress { height: 10px; background: var(--border); border-radius: 5px; overflow: hidden; margin: 6px 0; }
+.progress > i { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
+.progress.done > i { background: var(--landing); }
+.progress.err > i { background: var(--burst); }

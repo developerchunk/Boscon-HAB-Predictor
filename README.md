@@ -59,6 +59,38 @@ new id and "(imported)" in the name), **Delete** removes the browser copy only �
 `src/data/__tests__/snapshot.test.ts`. Storage is per browser profile and per site origin, so a
 record saved on `localhost` is not visible on the Vercel host; use Download/Import to move it.
 
+## GFS archive for any pad (`Climatology` tab, "GFS archive for the current pad")
+
+The bundled climatology is for the Pune region (radiosondes) and the Jejuri pad (daily GFS
+column). For any other pad the Climatology tab downloads the Open-Meteo historical-forecast
+archive (GFS, 23 levels to 10 hPa, every hour) at the pad: one request per calendar month, stored
+raw in IndexedDB, so every later selection — months, a date window, years, and the launch hour —
+is served offline. The card shows how many months will be fetched, the expected size and time,
+and while it runs a progress bar with months done, bytes received, elapsed and remaining time,
+and a Cancel button. Every month is written as it arrives, so a cancelled or quota-stopped
+download resumes by pressing Download again (stored months are skipped), and the download keeps
+running while other tabs are in use (`src/data/archive.ts`).
+
+Measured 2026-09-22 at the Solapur pad from this machine: October–December 2025 came to 1.0 MB in
+33 s (356 kB and 17 s for the first month, about 8 s each for the next two; a later single month
+took 3 s). The full archive, April 2021 to the current month, is 66 months ≈ 23 MB and, at the
+measured 11 s per month, about 12 minutes; the card uses the last measured time in this browser,
+and this measurement until there is one. Each month is one Open-Meteo request weighted as several
+calls, so the full archive uses a noticeable part of the free hourly quota — the download stops with
+a message if the quota is hit and resumes next hour.
+
+## Storage tab
+
+Lists everything the site keeps in the browser with a delete for each item, a multi-select
+delete, and "Delete everything": saved predictions and downloaded archives (IndexedDB, with each
+archive expandable to its months), the small localStorage settings (including Mapbox GL's own
+telemetry keys), and this page load's in-memory Open-Meteo responses and decoded terrain tiles.
+The browser's own HTTP cache (map tiles, fonts, the two bundled data files) cannot be enumerated
+or cleared by a page; the last table reports what was loaded this session from the resource
+timing API, and the browser's site-data settings clear it. Verified 2026-09-22: single delete of
+one archive month, multi-select delete of two months plus a setting, and Delete everything (the
+site's storage estimate fell from 25.8 MB to 72 kB and the database was recreated empty).
+
 ## Hosting on Vercel
 
 The app is a static Vite build, so Vercel serves it from the repository with no server code.

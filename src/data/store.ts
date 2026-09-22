@@ -24,11 +24,18 @@ export interface SavedPrediction {
   burstCalc?: any; climatology?: any; flight3d?: any;
 }
 
-const DB = "boscon-hab-predictor", VER = 1;
+const DB = "boscon-hab-predictor", VER = 2;
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB, VER);
-    req.onupgradeneeded = () => { const db = req.result; if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "id" }); if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs", { keyPath: "id" }); };
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs", { keyPath: "id" });
+      // v2: downloaded GFS archives, one row per location and one row per month of raw hourly data
+      if (!db.objectStoreNames.contains("archLocs")) db.createObjectStore("archLocs", { keyPath: "loc" });
+      if (!db.objectStoreNames.contains("archMonths")) db.createObjectStore("archMonths", { keyPath: "key" });
+    };
     req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error);
   });
 }
@@ -101,4 +108,81 @@ export function downloadSaved(rec: SavedPrediction): void {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 export const newId = () => `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-export const fmtBytes = (b: number) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.round(b / 1024)} kB`);
+export const fmtBytes = (b: number) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : b >= 1024 ? `${Math.round(b / 1024)} kB` : `${Math.round(b)} B`);
+
+/* ------------------------------------------------------------------ downloaded GFS archives */
+/** One downloaded location: which months are present and how much they take. */
+export interface ArchiveLoc { loc: string; lat: number; lon: number; name: string; months: string[]; bytes: number; updatedAt: string }
+export interface ArchiveMonthRow { key: string; loc: string; ym: string; text: string; bytes: number; fetchedAt: string }
+export const archiveLocKey = (lat: number, lon: number) => `${lat.toFixed(2)},${lon.toFixed(2)}`;
+export async function listArchiveLocations(): Promise<ArchiveLoc[]> {
+  const db = await openDb();
+  const all = await tx<ArchiveLoc[]>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").getAll());
+  db.close();
+  return (all ?? []).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+export async function getArchiveLocation(loc: string): Promise<ArchiveLoc | null> {
+  const db = await openDb();
+  const row = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
+  db.close();
+  return row ?? null;
+}
+/** Store one month and update the location row (creating it if needed). Returns the updated location. */
+export async function putArchiveMonth(o: { lat: number; lon: number; name: string; ym: string; text: string }): Promise<ArchiveLoc> {
+  const loc = archiveLocKey(o.lat, o.lon);
+  const db = await openDb();
+  const prev = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
+  const old = await tx<ArchiveMonthRow | undefined>(db, ["archMonths"], "readonly", t => t.objectStore("archMonths").get(`${loc}|${o.ym}`));
+  const row: ArchiveMonthRow = { key: `${loc}|${o.ym}`, loc, ym: o.ym, text: o.text, bytes: o.text.length, fetchedAt: new Date().toISOString() };
+  const months = [...new Set([...(prev?.months ?? []), o.ym])].sort();
+  const rec: ArchiveLoc = { loc, lat: o.lat, lon: o.lon, name: o.name || prev?.name || loc, months, bytes: (prev?.bytes ?? 0) - (old?.bytes ?? 0) + row.bytes, updatedAt: row.fetchedAt };
+  await tx(db, ["archLocs", "archMonths"], "readwrite", t => { t.objectStore("archMonths").put(row); t.objectStore("archLocs").put(rec); });
+  db.close();
+  return rec;
+}
+export async function getArchiveMonth(loc: string, ym: string): Promise<ArchiveMonthRow | null> {
+  const db = await openDb();
+  const row = await tx<ArchiveMonthRow | undefined>(db, ["archMonths"], "readonly", t => t.objectStore("archMonths").get(`${loc}|${ym}`));
+  db.close();
+  return row ?? null;
+}
+export async function renameArchiveLocation(loc: string, name: string): Promise<void> {
+  const db = await openDb();
+  const rec = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
+  if (rec) { rec.name = name; await tx(db, ["archLocs"], "readwrite", t => t.objectStore("archLocs").put(rec)); }
+  db.close();
+}
+export async function deleteArchiveLocation(loc: string): Promise<void> {
+  const db = await openDb();
+  const rec = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
+  await tx(db, ["archLocs", "archMonths"], "readwrite", t => { for (const ym of rec?.months ?? []) t.objectStore("archMonths").delete(`${loc}|${ym}`); t.objectStore("archLocs").delete(loc); });
+  db.close();
+}
+/** Remove one stored month; the location row is updated, and removed when no month is left. */
+export async function deleteArchiveMonth(loc: string, ym: string): Promise<void> {
+  const db = await openDb();
+  const rec = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
+  const row = await tx<ArchiveMonthRow | undefined>(db, ["archMonths"], "readonly", t => t.objectStore("archMonths").get(`${loc}|${ym}`));
+  await tx(db, ["archLocs", "archMonths"], "readwrite", t => {
+    t.objectStore("archMonths").delete(`${loc}|${ym}`);
+    if (rec) {
+      const months = rec.months.filter(m => m !== ym);
+      if (months.length) t.objectStore("archLocs").put({ ...rec, months, bytes: Math.max(0, rec.bytes - (row?.bytes ?? 0)), updatedAt: new Date().toISOString() });
+      else t.objectStore("archLocs").delete(loc);
+    }
+  });
+  db.close();
+}
+export async function listArchiveMonths(loc: string): Promise<{ ym: string; bytes: number; fetchedAt: string }[]> {
+  const rec = await getArchiveLocation(loc);
+  if (!rec) return [];
+  const db = await openDb();
+  const out: { ym: string; bytes: number; fetchedAt: string }[] = [];
+  for (const ym of rec.months) { const row = await tx<ArchiveMonthRow | undefined>(db, ["archMonths"], "readonly", t => t.objectStore("archMonths").get(`${loc}|${ym}`)); if (row) out.push({ ym, bytes: row.bytes, fetchedAt: row.fetchedAt }); }
+  db.close();
+  return out;
+}
+/** Drop the whole IndexedDB database (saved predictions and archives). Resolves when the browser has removed it. */
+export function deleteDatabase(): Promise<void> {
+  return new Promise((resolve, reject) => { const r = indexedDB.deleteDatabase(DB); r.onsuccess = () => resolve(); r.onerror = () => reject(r.error); r.onblocked = () => resolve(); });
+}

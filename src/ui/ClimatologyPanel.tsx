@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { loadIgra, loadGfs, levelStats, MONTH_NAMES, monthOf, yearOf, type StoredProfile, type IgraBundle, type GfsBundle } from "../data/climatology";
 import { planFill, buildFlightConfig, type PredictInputs } from "../physics/predictor";
 import { isa } from "../physics/atmosphere";
 import { callWorker } from "./worker-client";
-import { fetchGfsArchiveProfiles, type ArchiveProfile } from "../data/openmeteo";
+import { type ArchiveProfile } from "../data/openmeteo";
+import { archiveDownloader, archiveLocKey, deleteArchiveLocation, listArchiveLocations, loadArchiveProfiles, monthsBetween, rememberedMsPerMonth, ymNow, ymValid, type ArchiveLoc } from "../data/archive";
+import { fmtBytes } from "../data/store";
 import { distanceM } from "../physics/geo";
 import { BandChart, PlanView, Histogram, LineChart } from "./charts";
 import { km, nm, compass, deg } from "./format";
@@ -12,7 +14,11 @@ const ALTS = [500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 1
 interface Landing { label: string; date: string; station?: string; lat: number; lon: number; rangeM: number; bearingDeg: number; eastM: number; northM: number; durationS: number; burstZ: number; clipped: boolean; error?: string; layers: any[] }
 
 export interface ClimatologySnapshot { source: string; months: number[]; selMode: "months" | "date"; centreDate: string; windowDays: number; yearFrom: number; yearTo: number; hour: "all" | "00" | "12"; landings: Landing[] | null }
-export function ClimatologyPanel({ inputs, initial, onSnapshot }: { inputs: PredictInputs; initial?: ClimatologySnapshot; onSnapshot?: (s: ClimatologySnapshot) => void }) {
+/** Measured 2026-09-22, first download at the Solapur pad: Oct–Dec 2025 came to 1.0 MB in 33 s (356 kB and 17 s for the first month, ~8 s for the next two). */
+const EST_BYTES_PER_MONTH = 350_000;
+const ASSUMED_MS_PER_MONTH = 11_000;
+const mmss = (ms: number) => { const s = Math.max(0, Math.round(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+export function ClimatologyPanel({ inputs, placeName, initial, onSnapshot }: { inputs: PredictInputs; placeName?: string; initial?: ClimatologySnapshot; onSnapshot?: (s: ClimatologySnapshot) => void }) {
   const [igra, setIgra] = useState<IgraBundle | null>(null);
   const [gfs, setGfs] = useState<GfsBundle | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -27,35 +33,63 @@ export function ClimatologyPanel({ inputs, initial, onSnapshot }: { inputs: Pred
   const [landings, setLandings] = useState<Landing[] | null>(initial?.landings ?? null);
   useEffect(() => { onSnapshot?.({ source, months, selMode, centreDate, windowDays, yearFrom, yearTo, hour, landings }); }, [source, months, selMode, centreDate, windowDays, yearFrom, yearTo, hour, landings]);
   const [busy, setBusy] = useState(false);
-  const [live, setLive] = useState<{ key: string; profiles: ArchiveProfile[] } | null>(null);
-  const [liveStatus, setLiveStatus] = useState<string>("");
-  const liveKey = `${inputs.launchLat.toFixed(2)},${inputs.launchLon.toFixed(2)}|${selMode === "months" ? months.join(",") : centreDate + "±" + windowDays}|${yearFrom}-${yearTo}`;
   const launchHoursUtc = useMemo(() => { const h = inputs.launchUtc.getUTCHours() + inputs.launchUtc.getUTCMinutes() / 60; return [...new Set([Math.floor(h), Math.ceil(h) % 24])]; }, [inputs.launchUtc]);
-  async function fetchLive() {
-    setLiveStatus("fetching…"); setLandings(null);
-    try {
-      const [cm, cd] = centreDate.split("-").map(Number);
-      const monthsWanted = selMode === "months" ? months : [...new Set([-1, 0, 1].map(k => { const d = new Date(Date.UTC(2026, cm - 1, cd + k * windowDays)); return d.getUTCMonth() + 1; }))];
-      const years = []; for (let y = Math.max(2021, yearFrom); y <= Math.min(yearTo, new Date().getUTCFullYear()); y++) years.push(y);
-      const profiles = await fetchGfsArchiveProfiles({ lat: inputs.launchLat, lon: inputs.launchLon, months: monthsWanted, years, hoursUtc: launchHoursUtc, onProgress: (d, t) => setLiveStatus(`fetching month ${d}/${t}…`) });
-      setLive({ key: liveKey, profiles }); setLiveStatus(`${profiles.length} launch-hour columns fetched`);
-    } catch (e) { setLiveStatus("failed: " + String((e as any).message ?? e)); }
+  const hoursKey = launchHoursUtc.join(",");
+  // ---- downloaded GFS archives (IndexedDB), and the download running in src/data/archive.ts
+  const isArch = source.startsWith("arch:");
+  const [archLocs, setArchLocs] = useState<ArchiveLoc[]>([]);
+  const refreshArch = () => listArchiveLocations().then(setArchLocs).catch(e => setErr(String(e)));
+  useEffect(() => { refreshArch(); }, []);
+  const dl = useSyncExternalStore(archiveDownloader.subscribe, archiveDownloader.getState);
+  const [, tick] = useState(0);
+  useEffect(() => { if (!dl.running) return; const t = window.setInterval(() => tick(n => n + 1), 1000); return () => window.clearInterval(t); }, [dl.running]);
+  useEffect(() => { if (dl.running && dl.done > 0) refreshArch(); }, [dl.done]);
+  useEffect(() => { if (!dl.running && dl.finishedAt) { refreshArch(); if (dl.loc && !dl.error && !dl.cancelled && dl.done === dl.total) setSource(`arch:${dl.loc}`); } }, [dl.running, dl.finishedAt]);
+  const [arch, setArch] = useState<{ loc: string; hours: string; rec: ArchiveLoc; profiles: ArchiveProfile[] } | null>(null);
+  const [archStatus, setArchStatus] = useState("");
+  useEffect(() => {
+    if (!isArch) return;
+    const loc = source.slice(5);
+    if (arch && arch.loc === loc && arch.hours === hoursKey && arch.rec.months.length === (archLocs.find(l => l.loc === loc)?.months.length ?? arch.rec.months.length)) return;
+    let alive = true;
+    setArchStatus("reading archive…");
+    loadArchiveProfiles(loc, launchHoursUtc, (d, t) => { if (alive) setArchStatus(`reading archive ${d}/${t} months…`); }).then(r => {
+      if (!alive) return;
+      if (!r) { setArch(null); setArchStatus("this archive is not in this browser — download it below"); return; }
+      setArch({ loc, hours: hoursKey, rec: r.rec, profiles: r.profiles }); setArchStatus(`${r.profiles.length} launch-hour columns from ${r.rec.months.length} months`);
+    }).catch(e => { if (alive) setArchStatus("failed: " + String(e?.message ?? e)); });
+    return () => { alive = false; };
+  }, [source, hoursKey, archLocs]);
+  const padLoc = archiveLocKey(inputs.launchLat, inputs.launchLon);
+  const padArch = archLocs.find(l => l.loc === padLoc) ?? null;
+  const [dlName, setDlName] = useState("");
+  const [dlFrom, setDlFrom] = useState("2021-04");
+  const [dlTo, setDlTo] = useState(ymNow());
+  const [dlOnlySel, setDlOnlySel] = useState(false);
+  const selMonthsSet = useMemo(() => { if (selMode === "months") return new Set(months); const [cm, cd] = centreDate.split("-").map(Number); return new Set([-1, 0, 1].map(k => new Date(Date.UTC(2026, cm - 1, cd + k * windowDays)).getUTCMonth() + 1)); }, [selMode, months, centreDate, windowDays]);
+  const dlMonths = useMemo(() => monthsBetween(dlFrom, dlTo).filter(ym => !dlOnlySel || selMonthsSet.has(+ym.slice(5, 7))), [dlFrom, dlTo, dlOnlySel, selMonthsSet]);
+  const dlNew = dlMonths.filter(ym => !padArch?.months.includes(ym));
+  const msPerMonth = dl.msPerMonth || rememberedMsPerMonth();
+  const dlIsThisPad = dl.loc === padLoc;
+  function startDownload() {
+    const name = dlName.trim() || padArch?.name || placeName?.trim() || `${inputs.launchLat.toFixed(3)}, ${inputs.launchLon.toFixed(3)}`;
+    archiveDownloader.start({ lat: inputs.launchLat, lon: inputs.launchLon, name, months: dlMonths });
   }
   useEffect(() => { loadIgra().then(setIgra).catch(e => setErr(String(e))); loadGfs().then(setGfs).catch(e => setErr(String(e))); }, []);
 
   const profiles: StoredProfile[] = useMemo(() => {
-    const all: StoredProfile[] = source === "gfs" ? (gfs?.profiles ?? []) : source === "gfs-live" ? (live && live.key === liveKey ? live.profiles : []) : (igra?.profiles.filter(p => p.s === source) ?? []);
+    const all: StoredProfile[] = source === "gfs" ? (gfs?.profiles ?? []) : isArch ? (arch && arch.loc === source.slice(5) ? arch.profiles : []) : (igra?.profiles.filter(p => p.s === source) ?? []);
     const doy = (d: string) => { const [y, m, dd] = d.split("-").map(Number); return Math.round((Date.UTC(y, m - 1, dd) - Date.UTC(y, 0, 1)) / 864e5); };
     const [cm, cd] = centreDate.split("-").map(Number);
     const target = Number.isFinite(cm) && Number.isFinite(cd) ? doy(`2026-${String(cm).padStart(2, "0")}-${String(cd).padStart(2, "0")}`) : NaN;
     const inSel = (p: StoredProfile) => selMode === "months" ? months.includes(monthOf(p)) : Math.abs(doy("2026" + p.d.slice(4)) - target) <= windowDays;
-    return all.filter(p => inSel(p) && yearOf(p) >= yearFrom && yearOf(p) <= yearTo && (hour === "all" || source === "gfs" || String(p.h).padStart(2, "0") === hour));
-  }, [igra, gfs, source, months, yearFrom, yearTo, hour, selMode, centreDate, windowDays, live, liveKey]);
+    return all.filter(p => inSel(p) && yearOf(p) >= yearFrom && yearOf(p) <= yearTo && (hour === "all" || source === "gfs" || isArch || String(p.h).padStart(2, "0") === hour));
+  }, [igra, gfs, source, months, yearFrom, yearTo, hour, selMode, centreDate, windowDays, arch]);
   const stats = useMemo(() => levelStats(profiles, 250, ALTS), [profiles]);
   const perMonth = useMemo(() => {
-    const all: StoredProfile[] = source === "gfs" ? (gfs?.profiles ?? []) : source === "gfs-live" ? (live?.profiles ?? []) : (igra?.profiles.filter(p => p.s === source) ?? []);
+    const all: StoredProfile[] = source === "gfs" ? (gfs?.profiles ?? []) : isArch ? (arch && arch.loc === source.slice(5) ? arch.profiles : []) : (igra?.profiles.filter(p => p.s === source) ?? []);
     return MONTH_NAMES.map((nm_, i) => { const ps = all.filter(p => monthOf(p) === i + 1 && yearOf(p) >= yearFrom && yearOf(p) <= yearTo); const s = levelStats(ps, 250, [3000, 12000, 20000, 28000]); return { name: nm_, n: ps.length, s }; });
-  }, [igra, gfs, source, yearFrom, yearTo, live]);
+  }, [igra, gfs, source, yearFrom, yearTo, arch]);
 
   async function fly() {
     setBusy(true); setLandings(null);
@@ -68,15 +102,15 @@ export function ClimatologyPanel({ inputs, initial, onSnapshot }: { inputs: Pred
       setLandings(out.results.filter(l => !l.error));
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
   }
-  const stationName = (id: string) => id === "gfs" ? "GFS at Jejuri (Open-Meteo archive)" : id === "gfs-live" ? `GFS at ${inputs.launchLat.toFixed(3)}, ${inputs.launchLon.toFixed(3)} (fetched)` : igra?.stations[id]?.name ?? id;
+  const stationName = (id: string) => id === "gfs" ? "GFS at Jejuri (Open-Meteo archive)" : id.startsWith("arch:") ? `GFS at ${archLocs.find(l => l.loc === id.slice(5))?.name ?? id.slice(5)} (downloaded archive, ${launchHoursUtc.map(h => String(h).padStart(2, "0") + "Z").join("/")})` : igra?.stations[id]?.name ?? id;
   const kmFromPad = (id: string) => igra?.stations[id] ? Math.round(distanceM(inputs.launchLat, inputs.launchLon, igra.stations[id].lat, igra.stations[id].lon) / 1000) : null;
   const ranges = landings?.map(l => l.rangeM / 1000) ?? [];
   const pct = (q: number) => { if (!ranges.length) return 0; const s = [...ranges].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(q * (s.length - 1)))]; };
   const rose = useMemo(() => { const names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]; const c = new Array(8).fill(0); for (const l of landings ?? []) c[Math.floor(((l.bearingDeg + 22.5) % 360) / 45)]++; return names.map((n, i) => ({ n, f: landings?.length ? c[i] / landings.length : 0 })); }, [landings]);
-  const yearsAvail = source === "gfs" ? [2022, 2026] : [igra?.stations[source]?.year_from ?? 2016, 2026];
+  const yearsAvail = source === "gfs" ? [2022, 2026] : isArch ? [2021, 2026] : [igra?.stations[source]?.year_from ?? 2016, 2026];
   const gfsVsIgra = useMemo(() => {
     // same-day comparison: GFS 05/06 UTC vs the IGRA 00Z sounding at the selected station (only Pune is close enough to mean anything: 43 km)
-    if (!igra || !gfs || source === "gfs") return null;
+    if (!igra || !gfs || source === "gfs" || isArch) return null;
     const byDate = new Map<string, StoredProfile>(); for (const p of gfs.profiles) if (p.h === 5) byDate.set(p.d, p);
     const pairs = profiles.filter(p => p.h === 0 && byDate.has(p.d)).map(p => [p, byDate.get(p.d)!] as const);
     if (pairs.length < 5) return { n: pairs.length, rows: [] as { z: number; rms: number; bias: number; meanSpd: number }[] };
@@ -92,17 +126,45 @@ export function ClimatologyPanel({ inputs, initial, onSnapshot }: { inputs: Pred
         <div className="field"><label>Source</label><select value={source} onChange={e => { setSource(e.target.value); setLandings(null); }}>
           {igra && Object.entries(igra.stations).sort((a, b) => (kmFromPad(a[0]) ?? 0) - (kmFromPad(b[0]) ?? 0)).map(([id, s]) => <option key={id} value={id}>{s.name} radiosonde — {kmFromPad(id)} km from pad ({s.n_profiles} deep soundings, {s.year_from}–)</option>)}
           <option value="gfs">GFS model column at Jejuri, 05/06 UTC daily, 2022–2026 (bundled)</option>
-          <option value="gfs-live">GFS model column at the current pad, launch hour, 2021– (fetched on demand)</option></select></div>
-        {source === "gfs-live" && <div className="card" style={{ padding: "8px 10px", margin: "6px 0" }}>
-          <div className="note" style={{ margin: 0 }}>Pulls the Open-Meteo GFS archive at {inputs.launchLat.toFixed(3)}, {inputs.launchLon.toFixed(3)} for the selected months and years at {launchHoursUtc.map(h => String(h).padStart(2, "0") + "Z").join(" and ")} (your launch hour). One request per month, ~0.7 MB each; the archive starts April 2021.</div>
-          <div className="row" style={{ marginTop: 6 }}><button className="secondary" onClick={fetchLive} disabled={liveStatus.startsWith("fetching")}>Fetch archive for this pad</button><span className="status">{live?.key === liveKey ? liveStatus : (live ? "pad/selection changed — fetch again" : liveStatus)}</span></div>
-        </div>}
+          {archLocs.map(l => <option key={l.loc} value={`arch:${l.loc}`}>GFS model column at {l.name} ({l.loc}) — downloaded, {l.months[0]} to {l.months[l.months.length - 1]}, {l.months.length} months{l.loc === padLoc ? " — this pad" : ""}</option>)}
+          {!padArch && <option value={`arch:${padLoc}`}>GFS model column at the current pad — not downloaded yet</option>}</select></div>
+        {isArch && <p className="note" style={{ marginTop: 0 }}>{archStatus}</p>}
+        <details open={isArch || dl.running} className="card" style={{ padding: "8px 10px", margin: "6px 0" }}>
+          <summary>GFS archive for the current pad — download once, use offline</summary>
+          <div className="note" style={{ margin: "4px 0" }}>Fetches the Open-Meteo GFS archive at <b>{inputs.launchLat.toFixed(3)}, {inputs.launchLon.toFixed(3)}</b>{placeName?.trim() ? ` (${placeName.trim()})` : ""}: one request per calendar month, every hour, all 23 levels to 10 hPa, stored raw in this browser so that any months, date window, years or launch hour can be used afterwards without the network. The archive starts April 2021.</div>
+          <div className="field"><label>Name</label><input value={dlName} placeholder={padArch?.name || placeName?.trim() || `${inputs.launchLat.toFixed(3)}, ${inputs.launchLon.toFixed(3)}`} onChange={e => setDlName(e.target.value)} /></div>
+          <div className="field"><label>From <span className="unit">YYYY-MM</span></label><input value={dlFrom} onChange={e => setDlFrom(e.target.value)} style={{ borderColor: ymValid(dlFrom) ? undefined : "var(--bad-border)" }} /></div>
+          <div className="field"><label>To <span className="unit">YYYY-MM</span></label><input value={dlTo} onChange={e => setDlTo(e.target.value)} style={{ borderColor: ymValid(dlTo) ? undefined : "var(--bad-border)" }} /></div>
+          <div className="field"><label>Only the months selected above ({[...selMonthsSet].sort((a, b) => a - b).map(m => MONTH_NAMES[m - 1]).join(", ")})</label><input type="checkbox" checked={dlOnlySel} onChange={e => setDlOnlySel(e.target.checked)} /></div>
+          <div className="note" style={{ margin: "4px 0" }}>
+            {dlMonths.length === 0 ? "No months in that range (the archive covers April 2021 to this month)." : <>
+              <b>{dlNew.length} month{dlNew.length === 1 ? "" : "s"} to download</b>{dlMonths.length - dlNew.length > 0 ? ` (${dlMonths.length - dlNew.length} of the ${dlMonths.length} already stored, skipped)` : ""}
+              {dlNew.length > 0 && <>, about {fmtBytes(dlNew.length * EST_BYTES_PER_MONTH)} (measured {fmtBytes(EST_BYTES_PER_MONTH)} per month) and about <b>{mmss(dlNew.length * (msPerMonth ?? ASSUMED_MS_PER_MONTH))}</b> at {((msPerMonth ?? ASSUMED_MS_PER_MONTH) / 1000).toFixed(1)} s per month ({msPerMonth ? "measured on the last download from this browser" : "the 2026-09-22 measurement, until this browser has measured its own"}). This can take a while for the full archive; it keeps running while you use other tabs, every month is kept as it arrives, and it uses part of the free Open-Meteo hourly quota (one request per month, weighted as several calls) — if the quota stops it, press Download again next hour to resume.</>}</>}
+          </div>
+          <div className="row" style={{ marginTop: 6 }}>
+            <button className="primary" disabled={dl.running || dlNew.length === 0} onClick={startDownload}>{dl.running ? "Downloading…" : padArch && dlNew.length > 0 && dlNew.length < dlMonths.length ? `Download the missing ${dlNew.length} month${dlNew.length === 1 ? "" : "s"}` : "Download"}</button>
+            {dl.running && <button className="secondary" onClick={() => archiveDownloader.cancel()}>Cancel</button>}
+          </div>
+          {(dl.running || dl.finishedAt) && dl.loc && <div style={{ marginTop: 6 }}>
+            <div className={"progress" + (dl.error ? " err" : !dl.running && dl.done === dl.total ? " done" : "")}><i style={{ width: `${dl.total ? (100 * dl.done) / dl.total : 0}%` }} /></div>
+            <div className="status">
+              {dl.name}{dlIsThisPad ? "" : ` (${dl.loc}, a different pad)`}: {dl.done}/{dl.total} months{dl.skipped ? ` (${dl.skipped} were already stored)` : ""} · {fmtBytes(dl.bytes)} received · {mmss((dl.finishedAt ?? Date.now()) - dl.startedAt)} elapsed
+              {dl.running && <> · {dl.msPerMonth ? `about ${mmss((dl.total - dl.done) * dl.msPerMonth)} left at ${(dl.msPerMonth / 1000).toFixed(1)} s per month` : "timing the first month…"} · fetching {dl.current}</>}
+              {!dl.running && !dl.error && !dl.cancelled && dl.done === dl.total && <> · done{dl.msPerMonth ? `, measured ${(dl.msPerMonth / 1000).toFixed(1)} s per month` : ""}</>}
+              {dl.cancelled && <> · cancelled — the {dl.done} stored months are kept; press Download to resume</>}
+            </div>
+            {dl.error && <div className="bad">{dl.error} The {dl.done} months already stored are kept; press Download again to resume.</div>}
+          </div>}
+          {archLocs.length > 0 && <table className="t" style={{ marginTop: 8 }}><thead><tr><th>stored archive</th><th>point</th><th>months</th><th>size</th><th /></tr></thead><tbody>
+            {archLocs.map(l => <tr key={l.loc}><td>{l.name}</td><td>{l.loc}</td><td>{l.months[0]} – {l.months[l.months.length - 1]} ({l.months.length})</td><td>{fmtBytes(l.bytes)}</td><td><button className="secondary" disabled={dl.running && dl.loc === l.loc} onClick={async () => { if (!confirm(`Delete the downloaded archive "${l.name}" (${l.months.length} months, ${fmtBytes(l.bytes)}) from this browser?`)) return; await deleteArchiveLocation(l.loc); if (source === `arch:${l.loc}`) { setArch(null); setLandings(null); } await refreshArch(); }}>Delete</button></td></tr>)}
+          </tbody></table>}
+        </details>
         <div className="field"><label>Select by</label><select value={selMode} onChange={e => { setSelMode(e.target.value as any); setLandings(null); }}><option value="months">whole months</option><option value="date">a date ± days (all years)</option></select></div>
         {selMode === "months" ? <div className="field"><label>Months</label><div className="row">{MONTH_NAMES.map((m, i) => <label key={m} style={{ fontSize: 12 }}><input type="checkbox" checked={months.includes(i + 1)} onChange={e => setMonths(ms => e.target.checked ? [...ms, i + 1].sort((a, b) => a - b) : ms.filter(x => x !== i + 1))} />{m}</label>)}</div></div>
           : <><div className="field"><label>Date <span className="unit">MM-DD</span></label><input value={centreDate} onChange={e => { setCentreDate(e.target.value); setLandings(null); }} /></div>
             <div className="field"><label>Window <span className="unit">± days</span></label><input type="number" value={windowDays} min={1} max={60} onChange={e => { setWindowDays(+e.target.value); setLandings(null); }} /></div></>}
         <div className="field"><label>Years</label><div className="row"><input type="number" value={yearFrom} min={yearsAvail[0]} max={2026} onChange={e => setYearFrom(+e.target.value)} style={{ width: 70 }} /> – <input type="number" value={yearTo} min={yearsAvail[0]} max={2026} onChange={e => setYearTo(+e.target.value)} style={{ width: 70 }} /></div></div>
-        {source !== "gfs" && <div className="field"><label>Sounding hour</label><select value={hour} onChange={e => setHour(e.target.value as any)}><option value="all">00Z and 12Z (05:30 and 17:30 IST)</option><option value="00">00Z only (05:30 IST)</option><option value="12">12Z only (17:30 IST)</option></select></div>}
+        {source !== "gfs" && !isArch && <div className="field"><label>Sounding hour</label><select value={hour} onChange={e => setHour(e.target.value as any)}><option value="all">00Z and 12Z (05:30 and 17:30 IST)</option><option value="00">00Z only (05:30 IST)</option><option value="12">12Z only (17:30 IST)</option></select></div>}
         <p className="note">{profiles.length} profiles selected. Radiosondes are launched at 00Z and 12Z; an 11:00 IST launch (05:30Z) sits between them. Upper winds change slowly, so both are used; the boundary layer differs, which matters only for the last few km of descent.</p>
         <div className="row"><button className="primary" disabled={busy || !profiles.length} onClick={fly}>{busy ? "Flying…" : `Fly the vehicle on all ${profiles.length} profiles`}</button></div>
         <p className="note">Vehicle: current Predict-tab fill ({inputs.balloonId}, {inputs.payloadKg} kg, {inputs.fillMode === "ascentRate" ? `${inputs.targetAscentMs} m/s` : inputs.fillMode}), ISA atmosphere from {inputs.launchAltM} m, landing at pad elevation. No Monte Carlo here: each dot is one real atmosphere.</p>
