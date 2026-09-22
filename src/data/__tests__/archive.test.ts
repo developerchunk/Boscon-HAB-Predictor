@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { monthsBetween, ymValid } from "../archive";
+import { monthsBetween, parseArchiveBundle, ymValid, ARCHIVE_FORMAT } from "../archive";
+import fetchScript from "../../../scripts/fetch_archive.ts?raw";
 import { archiveMonthToProfiles, MODEL_LEVELS, type ArchiveMonth } from "../openmeteo";
 
 describe("monthsBetween", () => {
@@ -33,5 +34,21 @@ describe("archiveMonthToProfiles", () => {
     expect(out[0].uv).toHaveLength(Math.floor(31000 / 250) + 1);
     expect(out[0].uv[40]).toEqual([100, 0]); // 10 m/s eastward in 0.1 m/s
     expect(out[0].col).toHaveLength(levels.length);
+  });
+});
+
+describe("archive bundles", () => {
+  it("parseArchiveBundle accepts the script's shape and rejects others", () => {
+    const good = { format: ARCHIVE_FORMAT, version: 1, loc: "17.72,75.84", lat: 17.721666, lon: 75.84237, name: "Solapur pad", fetchedAt: "2026-09-22T00:00:00Z", months: { "2025-10": { time: ["2025-10-01T00:00"], vars: { wind_speed_500hPa: [1] } } } };
+    expect(parseArchiveBundle(JSON.stringify(good)).name).toBe("Solapur pad");
+    expect(() => parseArchiveBundle("nope")).toThrow(/JSON/);
+    expect(() => parseArchiveBundle(JSON.stringify({ hello: 1 }))).toThrow(/format/);
+    expect(() => parseArchiveBundle(JSON.stringify({ ...good, version: 9 }))).toThrow(/version/);
+    expect(() => parseArchiveBundle(JSON.stringify({ ...good, months: { "2025-13": { time: [], vars: {} } } }))).toThrow(/malformed/);
+  });
+  it("scripts/fetch_archive.ts uses the same GFS levels as the app", () => {
+    const m = fetchScript.match(/const GFS_LEVELS = \[([^\]]+)\]/);
+    expect(m).not.toBeNull();
+    expect(m![1].split(",").map(Number)).toEqual(MODEL_LEVELS.gfs_seamless);
   });
 });

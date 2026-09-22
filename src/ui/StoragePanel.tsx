@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import { deleteArchiveLocation, deleteArchiveMonth, deleteDatabase, deleteSaved, fmtBytes, listArchiveLocations, listArchiveMonths, listSaved, storageEstimate, type ArchiveLoc, type SavedMeta } from "../data/store";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { deleteArchiveMonth, deleteDatabase, deleteSaved, fmtBytes, listArchiveLocations, listArchiveMonths, listSaved, storageEstimate, type ArchiveLoc, type SavedMeta } from "../data/store";
 import { cacheEntries, clearCache } from "../data/openmeteo";
 import { clearTileCache, tileCacheStats } from "../data/terrainrgb";
-import { archiveDownloader } from "../data/archive";
+import { archiveDownloader, ARCHIVE_EXT, BUNDLED_ARCHIVES, deleteArchiveLocation, exportArchive, setBundledAutoInstall } from "../data/archive";
 import { istString } from "./format";
 
 /**
@@ -63,6 +63,16 @@ export function StoragePanel(p: { currentId: string | null; onPredictionsDeleted
   const selBytes = items.filter(i => sel.has(i.id)).reduce((s, i) => s + i.bytes, 0);
   const toggle = (id: string, on: boolean) => setSel(s => { const n = new Set(s); if (on) n.add(id); else n.delete(id); return n; });
   const running = archiveDownloader.getState().running;
+  const fileRef = useRef<HTMLInputElement>(null);
+  async function importArchive(f: File) {
+    setBusy(true); setMsg(`Installing "${f.name}"…`);
+    try {
+      await archiveDownloader.install({ file: f, label: f.name.replace(/\.habarchive\.json(\.gz)?$/i, "") });
+      const st = archiveDownloader.getState();
+      setMsg(st.error ? st.error : `Installed "${st.name}": ${st.done} months${st.skipped ? ` (${st.skipped} were already stored)` : ""}.`);
+    } catch (e: any) { setMsg("Import failed: " + String(e?.message ?? e)); }
+    finally { setBusy(false); await refresh(); }
+  }
 
   async function deleteItems(ids: string[]) {
     setBusy(true);
@@ -90,6 +100,7 @@ export function StoragePanel(p: { currentId: string | null; onPredictionsDeleted
       await deleteDatabase();
       clearCache(); clearTileCache();
       try { localStorage.clear(); } catch { /* ignore */ }
+      for (const b of BUNDLED_ARCHIVES) setBundledAutoInstall(b.loc, false);
       try { if ("caches" in window) for (const k of await caches.keys()) await caches.delete(k); } catch { /* ignore */ }
       if (ids.length) p.onPredictionsDeleted(ids);
       setMsg("Everything deleted. The browser's own HTTP cache (map tiles, fonts) is cleared from the browser's settings, not from here.");
@@ -114,6 +125,8 @@ export function StoragePanel(p: { currentId: string | null; onPredictionsDeleted
       <button className="secondary" disabled={busy || !sel.size} onClick={() => setSel(new Set())}>Clear selection</button>
       <button className="primary" disabled={busy || !sel.size || running} onClick={() => { if (confirm(`Delete the ${sel.size} selected item${sel.size === 1 ? "" : "s"} (${fmtBytes(selBytes)})?`)) deleteItems([...sel]); }}>Delete selected ({sel.size}, {fmtBytes(selBytes)})</button>
       <button className="secondary" disabled={busy || running} onClick={deleteEverything} style={{ borderColor: "var(--bad-border)" }}>Delete everything</button>
+      <button className="secondary" disabled={busy || running} onClick={() => fileRef.current?.click()}>Import archive file…</button>
+      <input ref={fileRef} type="file" accept=".gz,.json,application/gzip,application/json" style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; e.target.value = ""; if (f) importArchive(f); }} />
       <button className="secondary" disabled={busy} onClick={() => refresh()}>Refresh</button>
       <span className="status">{running ? "an archive download is running — finish or cancel it in the Climatology tab before deleting" : msg}</span>
     </div>
@@ -124,9 +137,10 @@ export function StoragePanel(p: { currentId: string | null; onPredictionsDeleted
     </tbody></table> : <p className="note">none</p>}
 
     <h3>Downloaded GFS archives ({archs.length}, {fmtBytes(totals.archs)})</h3>
+    <p className="note">Download writes an archive as a portable <code>{ARCHIVE_EXT}</code> file (the raw months, gzip); "Import archive file…" above installs such a file into this browser. An archive bundled with the site that you delete here stays deleted until you press Install in the Climatology tab.</p>
     {archs.length ? <table className="t"><thead><tr><th /><th>archive</th><th>point</th><th>months</th><th>size</th><th /></tr></thead><tbody>
       {archs.flatMap(a => [
-        <tr key={a.loc}><td>{cb(`arch:${a.loc}`)}</td><td><button className="secondary" style={{ padding: "2px 8px" }} onClick={() => setOpenArch(s => { const n = new Set(s); if (n.has(a.loc)) n.delete(a.loc); else n.add(a.loc); return n; })}>{openArch.has(a.loc) ? "▾" : "▸"}</button> {a.name}</td><td>{a.loc}</td><td>{a.months[0]} – {a.months[a.months.length - 1]} ({a.months.length})</td><td>{fmtBytes(a.bytes)}</td><td>{del(`arch:${a.loc}`, "Delete", running)}</td></tr>,
+        <tr key={a.loc}><td>{cb(`arch:${a.loc}`)}</td><td><button className="secondary" style={{ padding: "2px 8px" }} onClick={() => setOpenArch(s => { const n = new Set(s); if (n.has(a.loc)) n.delete(a.loc); else n.add(a.loc); return n; })}>{openArch.has(a.loc) ? "▾" : "▸"}</button> {a.name}</td><td>{a.loc}</td><td>{a.months[0]} – {a.months[a.months.length - 1]} ({a.months.length})</td><td>{fmtBytes(a.bytes)}</td><td><button className="secondary" disabled={busy} onClick={() => exportArchive(a.loc).catch(e => setMsg(String(e?.message ?? e)))}>Download</button> {del(`arch:${a.loc}`, "Delete", running)}</td></tr>,
         ...(openArch.has(a.loc) ? (months[a.loc] ?? []).map(m => <tr key={`${a.loc}|${m.ym}`} style={{ color: "var(--text-2)" }}><td>{cb(`month:${a.loc}|${m.ym}`)}</td><td style={{ paddingLeft: 36 }}>{m.ym}</td><td /><td>fetched {istString(new Date(m.fetchedAt))}</td><td>{fmtBytes(m.bytes)}</td><td>{del(`month:${a.loc}|${m.ym}`, "Delete", running)}</td></tr>) : []),
       ])}
     </tbody></table> : <p className="note">none</p>}

@@ -4,7 +4,7 @@ import { planFill, buildFlightConfig, type PredictInputs } from "../physics/pred
 import { isa } from "../physics/atmosphere";
 import { callWorker } from "./worker-client";
 import { type ArchiveProfile } from "../data/openmeteo";
-import { archiveDownloader, archiveLocKey, deleteArchiveLocation, listArchiveLocations, loadArchiveProfiles, monthsBetween, rememberedMsPerMonth, ymNow, ymValid, type ArchiveLoc } from "../data/archive";
+import { archiveDownloader, archiveLocKey, BUNDLED_ARCHIVES, bundledAutoInstallAllowed, setBundledAutoInstall, deleteArchiveLocation, listArchiveLocations, loadArchiveProfiles, monthsBetween, rememberedMsPerMonth, ymNow, ymValid, type ArchiveLoc } from "../data/archive";
 import { fmtBytes } from "../data/store";
 import { distanceM } from "../physics/geo";
 import { BandChart, PlanView, Histogram, LineChart } from "./charts";
@@ -62,6 +62,16 @@ export function ClimatologyPanel({ inputs, placeName, initial, onSnapshot }: { i
   }, [source, hoursKey, archLocs]);
   const padLoc = archiveLocKey(inputs.launchLat, inputs.launchLon);
   const padArch = archLocs.find(l => l.loc === padLoc) ?? null;
+  const [archLoaded, setArchLoaded] = useState(false);
+  useEffect(() => { listArchiveLocations().then(l => { setArchLocs(l); setArchLoaded(true); }).catch(() => setArchLoaded(true)); }, []);
+  const installBundled = (b: typeof BUNDLED_ARCHIVES[number]) => { setBundledAutoInstall(b.loc, true); return archiveDownloader.install({ url: `${import.meta.env.BASE_URL}${b.file}`, label: b.name, rawBytes: b.rawBytes }); };
+  // A bundled archive for this pad installs itself the first time the tab opens (from this site, no Open-Meteo request).
+  useEffect(() => {
+    if (!archLoaded || dl.running) return;
+    const b = BUNDLED_ARCHIVES.find(x => x.loc === padLoc);
+    const have = archLocs.find(l => l.loc === padLoc);
+    if (b && bundledAutoInstallAllowed(b.loc) && (!have || have.months.length < b.monthCount) && !(dl.finishedAt && dl.loc === padLoc)) installBundled(b);
+  }, [archLoaded, padLoc]);
   const [dlName, setDlName] = useState("");
   const [dlFrom, setDlFrom] = useState("2021-04");
   const [dlTo, setDlTo] = useState(ymNow());
@@ -141,19 +151,24 @@ export function ClimatologyPanel({ inputs, placeName, initial, onSnapshot }: { i
               <b>{dlNew.length} month{dlNew.length === 1 ? "" : "s"} to download</b>{dlMonths.length - dlNew.length > 0 ? ` (${dlMonths.length - dlNew.length} of the ${dlMonths.length} already stored, skipped)` : ""}
               {dlNew.length > 0 && <>, about {fmtBytes(dlNew.length * EST_BYTES_PER_MONTH)} (measured {fmtBytes(EST_BYTES_PER_MONTH)} per month) and about <b>{mmss(dlNew.length * (msPerMonth ?? ASSUMED_MS_PER_MONTH))}</b> at {((msPerMonth ?? ASSUMED_MS_PER_MONTH) / 1000).toFixed(1)} s per month ({msPerMonth ? "measured on the last download from this browser" : "the 2026-09-22 measurement, until this browser has measured its own"}). This can take a while for the full archive; it keeps running while you use other tabs, every month is kept as it arrives, and it uses part of the free Open-Meteo hourly quota (one request per month, weighted as several calls) — if the quota stops it, press Download again next hour to resume.</>}</>}
           </div>
+          {BUNDLED_ARCHIVES.length > 0 && <div className="note" style={{ margin: "6px 0" }}><b>Bundled with this site</b> (installs from the site, no Open-Meteo request): {BUNDLED_ARCHIVES.map(b => { const have = archLocs.find(l => l.loc === b.loc); const complete = !!have && have.months.length >= b.monthCount; return <span key={b.loc} style={{ display: "inline-block", marginRight: 12 }}>{b.name} ({b.loc}), {b.from} – {b.to}, {b.monthCount} months, {b.gzBytes ? fmtBytes(b.gzBytes) + " compressed" : "gzip"}, fetched {b.fetched}{b.loc === padLoc ? " — this pad" : ""}: {complete ? <span>installed</span> : <button className="secondary" style={{ padding: "2px 8px" }} disabled={dl.running} onClick={() => installBundled(b)}>{have ? `Install the missing ${b.monthCount - have.months.length} months` : "Install"}</button>}</span>; })}</div>}
           <div className="row" style={{ marginTop: 6 }}>
             <button className="primary" disabled={dl.running || dlNew.length === 0} onClick={startDownload}>{dl.running ? "Downloading…" : padArch && dlNew.length > 0 && dlNew.length < dlMonths.length ? `Download the missing ${dlNew.length} month${dlNew.length === 1 ? "" : "s"}` : "Download"}</button>
             {dl.running && <button className="secondary" onClick={() => archiveDownloader.cancel()}>Cancel</button>}
           </div>
           {(dl.running || dl.finishedAt) && dl.loc && <div style={{ marginTop: 6 }}>
-            <div className={"progress" + (dl.error ? " err" : !dl.running && dl.done === dl.total ? " done" : "")}><i style={{ width: `${dl.total ? (100 * dl.done) / dl.total : 0}%` }} /></div>
-            <div className="status">
+            <div className={"progress" + (dl.error ? " err" : !dl.running && dl.done === dl.total ? " done" : "")}><i style={{ width: `${dl.mode === "install" && dl.phase !== "writing months" && dl.phase !== "installed" ? (dl.fileTotal ? Math.min(100, (100 * dl.fileReceived) / dl.fileTotal) : 0) : dl.total ? (100 * dl.done) / dl.total : 0}%` }} /></div>
+            {dl.mode === "install" ? <div className="status">
+              {dl.name}{dl.loc && !dlIsThisPad ? ` (${dl.loc}, a different pad)` : ""}: {dl.phase === "downloading file" || dl.phase === "reading file" ? `${dl.phase} — ${fmtBytes(dl.fileReceived)}${dl.fileTotal ? ` of ${fmtBytes(dl.fileTotal)}` : ""}${dl.phase === "downloading file" ? " (the browser decompresses the file as it arrives)" : ""}` : dl.phase === "decompressing" ? `decompressing ${fmtBytes(dl.fileReceived)}…` : `${dl.done}/${dl.total} months written${dl.skipped ? ` (${dl.skipped} were already stored)` : ""}`} · {mmss((dl.finishedAt ?? Date.now()) - dl.startedAt)} elapsed
+              {!dl.running && !dl.error && !dl.cancelled && dl.phase === "installed" && <> · installed from {dl.fileTotal ? fmtBytes(dl.fileTotal) : "file"}</>}
+              {dl.cancelled && <> · cancelled — months already written are kept</>}
+            </div> : <div className="status">
               {dl.name}{dlIsThisPad ? "" : ` (${dl.loc}, a different pad)`}: {dl.done}/{dl.total} months{dl.skipped ? ` (${dl.skipped} were already stored)` : ""} · {fmtBytes(dl.bytes)} received · {mmss((dl.finishedAt ?? Date.now()) - dl.startedAt)} elapsed
               {dl.running && <> · {dl.msPerMonth ? `about ${mmss((dl.total - dl.done) * dl.msPerMonth)} left at ${(dl.msPerMonth / 1000).toFixed(1)} s per month` : "timing the first month…"} · fetching {dl.current}</>}
               {!dl.running && !dl.error && !dl.cancelled && dl.done === dl.total && <> · done{dl.msPerMonth ? `, measured ${(dl.msPerMonth / 1000).toFixed(1)} s per month` : ""}</>}
               {dl.cancelled && <> · cancelled — the {dl.done} stored months are kept; press Download to resume</>}
-            </div>
-            {dl.error && <div className="bad">{dl.error} The {dl.done} months already stored are kept; press Download again to resume.</div>}
+            </div>}
+            {dl.error && <div className="bad">{dl.error} {dl.mode === "install" ? "Months already written are kept." : `The ${dl.done} months already stored are kept; press Download again to resume.`}</div>}
           </div>}
           {archLocs.length > 0 && <table className="t" style={{ marginTop: 8 }}><thead><tr><th>stored archive</th><th>point</th><th>months</th><th>size</th><th /></tr></thead><tbody>
             {archLocs.map(l => <tr key={l.loc}><td>{l.name}</td><td>{l.loc}</td><td>{l.months[0]} – {l.months[l.months.length - 1]} ({l.months.length})</td><td>{fmtBytes(l.bytes)}</td><td><button className="secondary" disabled={dl.running && dl.loc === l.loc} onClick={async () => { if (!confirm(`Delete the downloaded archive "${l.name}" (${l.months.length} months, ${fmtBytes(l.bytes)}) from this browser?`)) return; await deleteArchiveLocation(l.loc); if (source === `arch:${l.loc}`) { setArch(null); setLandings(null); } await refreshArch(); }}>Delete</button></td></tr>)}

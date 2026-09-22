@@ -79,6 +79,27 @@ and this measurement until there is one. Each month is one Open-Meteo request we
 calls, so the full archive uses a noticeable part of the free hourly quota — the download stops with
 a message if the quota is hit and resumes next hour.
 
+### Bundled Solapur archive, and portable archive files
+
+`public/data/archives/solapur.habarchive.json.gz` is the complete archive at the Solapur pad
+(17.721666, 75.84237), April 2021 to September 2026, 66 months, fetched 2026-09-22 with
+`scripts/fetch_archive.ts` (22.8 MB of raw months, 5.55 MB gzipped). The Climatology tab installs
+it into the browser the first time it opens with the pad at that point — from the site, with no
+Open-Meteo request — showing the file download and the months being written on the same progress
+bar, and lists it under "Bundled with this site" with an Install button for any other pad. To bundle
+another pad:
+
+```bash
+npx tsx scripts/fetch_archive.ts --lat 17.721666 --lon 75.84237 --name "Solapur pad" --from 2021-04 --to 2026-09 --out public/data/archives/solapur.habarchive.json.gz
+```
+
+then add it to `BUNDLED_ARCHIVES` in `src/data/archive.ts`. The script caches each month in
+`.cache/archive/` so a stopped run resumes; it waits out per-minute 429s and stops on the hourly one.
+
+The same file format is what the Storage tab's **Download** writes for any stored archive and what
+**Import archive file…** reads, so an archive fetched in one browser can be moved to another (or to
+the Vercel host, which has its own storage) without fetching it again.
+
 ## Storage tab
 
 Lists everything the site keeps in the browser with a delete for each item, a multi-select
