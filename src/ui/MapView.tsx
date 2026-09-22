@@ -41,6 +41,7 @@ const TOKEN = (import.meta.env.VITE_MAPBOX_TOKEN as string | undefined)?.trim();
 
 export function MapView(p: { data: MapData; onLaunchMove: (lat: number, lon: number) => void; fitKey: string }) {
   const div = useRef<HTMLDivElement>(null);
+  const wrap = useRef<HTMLDivElement>(null);
   const map = useRef<mapboxgl.Map | null>(null);
   const marker = useRef<mapboxgl.Marker | null>(null);
   const ready = useRef(false);
@@ -48,6 +49,35 @@ export function MapView(p: { data: MapData; onLaunchMove: (lat: number, lon: num
   const [terrain, setTerrain] = useState<TerrainMode>("2d");
   const [zoom, setZoom] = useState(8.5);
   const [picking, setPicking] = useState(false);
+  // full screen: native Fullscreen API on the whole map panel when the browser grants it, otherwise a
+  // fixed-position expansion of the panel to the window (embedded panes and some browsers refuse the API)
+  const [full, setFull] = useState<null | "native" | "css">(null);
+  const fullRef = useRef<null | "native" | "css">(null);
+  async function toggleFull() {
+    const el = wrap.current; if (!el) return;
+    if (fullRef.current) {
+      if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch { /* ignore */ } }
+      fullRef.current = null; setFull(null); return;
+    }
+    // some embedded browsers never settle the requestFullscreen() promise: race it against a short timeout
+    let native = false;
+    try {
+      await Promise.race([el.requestFullscreen().catch(() => undefined), new Promise(r => setTimeout(r, 400))]);
+      native = document.fullscreenElement === el;
+    } catch { native = false; }
+    fullRef.current = native ? "native" : "css"; setFull(fullRef.current);
+  }
+  useEffect(() => {
+    const onChange = () => {
+      const el = wrap.current;
+      if (document.fullscreenElement && el && document.fullscreenElement === el) { fullRef.current = "native"; setFull("native"); } // late native success
+      else if (fullRef.current === "native" && !document.fullscreenElement) { fullRef.current = null; setFull(null); }
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && fullRef.current === "css") { fullRef.current = null; setFull(null); } };
+    document.addEventListener("fullscreenchange", onChange); document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("fullscreenchange", onChange); document.removeEventListener("keydown", onKey); };
+  }, []);
+  useEffect(() => { const m = map.current; if (m) setTimeout(() => m.resize(), 50); }, [full]);
   const pickingRef = useRef(false);
   const [cursor, setCursor] = useState<[number, number] | null>(null);
 
@@ -178,7 +208,7 @@ export function MapView(p: { data: MapData; onLaunchMove: (lat: number, lon: num
       : <p className="note">Create <code>.env</code> in the project root with <code>VITE_MAPBOX_TOKEN=pk.…</code> and restart <code>npm run dev</code>. The prediction, charts and plan view below work without the map.</p>}
   </div></div>;
   const interval = zoom >= 14 ? 10 : zoom >= 13 ? 20 : zoom >= 12 ? 50 : zoom >= 11 ? 100 : zoom >= 10 ? 200 : 500;
-  return <div className="mapwrap"><div ref={div} className="map" />
+  return <div className={"mapwrap" + (full === "css" ? " expanded" : "")} ref={wrap}><div ref={div} className="map" />
     <div className="map-overlay top-left">
       <div className="row" style={{ gap: 4 }}>
         <span className="note" style={{ margin: 0 }}>Terrain</span>
@@ -187,6 +217,8 @@ export function MapView(p: { data: MapData; onLaunchMove: (lat: number, lon: num
         {picking
           ? <button className="tab small active" onClick={cancelPick}>click the map to set the pad… (cancel)</button>
           : <button className="tab small" onClick={startPick} title="Then click anywhere on the map; the pad moves there and its elevation is read from the DEM">Pick pad on map</button>}
+        <span style={{ width: 8 }} />
+        <button className={"tab small" + (full ? " active" : "")} onClick={toggleFull} title="Full screen (Esc to leave)">{full ? "⤡ Exit full screen" : "⤢ Full screen"}</button>
       </div>
       <div className="note mono" style={{ margin: "4px 0 0", fontSize: 11 }}>
         pad {p.data.launch[0].toFixed(5)}, {p.data.launch[1].toFixed(5)}{cursor ? ` · cursor ${cursor[0].toFixed(5)}, ${cursor[1].toFixed(5)}` : " · drag the marker or pick on map"}

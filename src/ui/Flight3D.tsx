@@ -73,7 +73,7 @@ function label(text: string, cls = "l3d") { const d = document.createElement("di
 export function Flight3D({ data, launchLat, launchLon, launchAltM }: { data: Flight3DData | null; launchLat: number; launchLon: number; launchAltM: number }) {
   const host = useRef<HTMLDivElement>(null);
   const three = useRef<{ renderer: THREE.WebGLRenderer; labels: CSS2DRenderer; scene: THREE.Scene; camera: THREE.PerspectiveCamera; controls: OrbitControls; group: THREE.Group; balloon: THREE.Group; balloonLabel: CSS2DObject } | null>(null);
-  const [exag, setExag] = useState(2);
+  const [exag, setExag] = useState(1);
   const [showTerrain, setShowTerrain] = useState(true);
   const [showWind, setShowWind] = useState(true);
   const [showColumn, setShowColumn] = useState(true);

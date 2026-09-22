@@ -1,7 +1,9 @@
 # BOSCON HAB predictor
 
-Landing predictor, burst calculator and Pune wind climatology for the HAB-1 flight from
-Jejuri (18.286293 N, 74.123039 E, 744.4 m AMSL). Browser app, no backend: forecast winds
+Landing predictor, burst calculator and Pune-region wind climatology for the HAB-1 flight. The
+default pad is 17.721666 N, 75.84237 E (9 km north-west of Solapur, 491.5 m AMSL from the Mapbox
+Terrain-RGB DEM); the bundled GFS archive and the Pune radiosonde climatology were built for the
+earlier Jejuri site (18.286293 N, 74.123039 E) and are labelled as such. Browser app, no backend: forecast winds
 come from Open-Meteo, the reference prediction from SondeHub's Tawhiri, terrain from the
 Copernicus DEM, and the climatology from NOAA radiosonde archives bundled in `public/data/`.
 
