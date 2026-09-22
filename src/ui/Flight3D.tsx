@@ -70,18 +70,20 @@ async function terrainFromTiles(lat0: number, lon0: number, x0: number, x1: numb
 }
 function label(text: string, cls = "l3d") { const d = document.createElement("div"); d.className = cls; d.textContent = text; return new CSS2DObject(d); }
 
-export function Flight3D({ data, launchLat, launchLon, launchAltM }: { data: Flight3DData | null; launchLat: number; launchLon: number; launchAltM: number }) {
+export interface Flight3DSnapshot { exag: number; showTerrain: boolean; showWind: boolean; showColumn: boolean; showMc: boolean; tSec: number }
+export function Flight3D({ data, launchLat, launchLon, launchAltM, initial, onSnapshot }: { data: Flight3DData | null; launchLat: number; launchLon: number; launchAltM: number; initial?: Flight3DSnapshot; onSnapshot?: (s: Flight3DSnapshot) => void }) {
   const host = useRef<HTMLDivElement>(null);
   const three = useRef<{ renderer: THREE.WebGLRenderer; labels: CSS2DRenderer; scene: THREE.Scene; camera: THREE.PerspectiveCamera; controls: OrbitControls; group: THREE.Group; balloon: THREE.Group; balloonLabel: CSS2DObject } | null>(null);
-  const [exag, setExag] = useState(1);
-  const [showTerrain, setShowTerrain] = useState(true);
-  const [showWind, setShowWind] = useState(true);
-  const [showColumn, setShowColumn] = useState(true);
-  const [showMc, setShowMc] = useState(true);
+  const [exag, setExag] = useState(initial?.exag ?? 1);
+  const [showTerrain, setShowTerrain] = useState(initial?.showTerrain ?? true);
+  const [showWind, setShowWind] = useState(initial?.showWind ?? true);
+  const [showColumn, setShowColumn] = useState(initial?.showColumn ?? true);
+  const [showMc, setShowMc] = useState(initial?.showMc ?? true);
   const [terrain, setTerrain] = useState<Terrain | null>(null);
   const [terrainStatus, setTerrainStatus] = useState("");
-  const [tSec, setTSec] = useState(0);
+  const [tSec, setTSec] = useState(initial?.tSec ?? 0);
   const [playing, setPlaying] = useState(false);
+  useEffect(() => { onSnapshot?.({ exag, showTerrain, showWind, showColumn, showMc, tSec }); }, [exag, showTerrain, showWind, showColumn, showMc, tSec]);
 
   // scene-space helpers (km): east -> x, north -> -z
   const toXZ = (lat: number, lon: number): [number, number] => { const [e, n] = eastNorthM(launchLat, launchLon, lat, lon); return [e / 1000, -n / 1000]; };

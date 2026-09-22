@@ -37,7 +37,10 @@ Burst:                                                                  D(z) ≥
     <h3>6. Climatology</h3>
     <p>Measured radiosondes from NOAA IGRA v2: Pune (43 km from the pad) 2016–2026, Mumbai and Nagpur 2022–2026 (Pune's own record is thin in 2021–2024), Goa and Hyderabad. Only soundings with wind to ≥30 km and ≥20 levels are used; wind-only levels without a height are placed by interpolating the sounding's own pressure–height pairs. Plus a daily 05/06 UTC GFS column at Jejuri from Open-Meteo's forecast archive, January 2022 to August 2026, which is a model, not a measurement, and is compared against the Pune radiosonde on the same days in the Climatology tab.</p>
 
-    <h3>7. What is not done, and known limits</h3>
+    <h3>7. Saved predictions</h3>
+    <p>Each completed run is stored in this browser (IndexedDB) with its inputs, settings, the whole wind grid, flight, Monte Carlo, Tawhiri and weather, plus the burst-calculator, climatology and 3-D-view state, so loading it later needs no network. The Saved tab downloads a record as a <code>.habpred.json</code> file, imports one, or deletes the browser copy. Records live in one browser profile and one site address; move them between machines with Download and Import.</p>
+
+    <h3>8. What is not done, and known limits</h3>
     <ul>
       <li>No forecast is reliable beyond ~7 days (Akerman, Wyoming Space Grant: night-before SondeHub predictions land within 8 km ~70% of the time). GFS reaches 16 days; the climatology is for planning beyond that.</li>
       <li>The ECMWF ensemble has only 14 levels, three of them in the stratosphere; its spread above 20 km is coarse.</li>

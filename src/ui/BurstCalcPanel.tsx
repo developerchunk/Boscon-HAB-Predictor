@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BALLOONS, balloonById, simulateAscent, neckLiftForAscentRate, cusfBurstCalc, type Gas, type CdModel } from "../physics/balloon";
 import { isa } from "../physics/atmosphere";
 import { terminalVelocity } from "../physics/descent";
@@ -6,17 +6,20 @@ import { RHO_SL } from "../physics/constants";
 import { LineChart } from "./charts";
 import { ft, fl } from "./format";
 
-export function BurstCalcPanel(p: { siteAltM: number }) {
-  const [balloonId, setBalloon] = useState("k1200");
-  const [gas, setGas] = useState<Gas>("hydrogen");
-  const [payload, setPayload] = useState(2.0);
-  const [mode, setMode] = useState<"ascentRate" | "neckLift">("ascentRate");
-  const [target, setTarget] = useState(5.0);
-  const [neck, setNeck] = useState(3.2);
-  const [siteAlt, setSiteAlt] = useState(p.siteAltM);
-  const [chuteD, setChuteD] = useState(1.2);
-  const [chuteCd, setChuteCd] = useState(0.75);
-  const [factor, setFactor] = useState(1.0);
+export interface BurstCalcSnapshot { balloonId: string; gas: Gas; payload: number; mode: "ascentRate" | "neckLift"; target: number; neck: number; siteAlt: number; chuteD: number; chuteCd: number; factor: number }
+export function BurstCalcPanel(p: { siteAltM: number; initial?: BurstCalcSnapshot; onSnapshot?: (s: BurstCalcSnapshot) => void }) {
+  const i = p.initial;
+  const [balloonId, setBalloon] = useState(i?.balloonId ?? "k1200");
+  const [gas, setGas] = useState<Gas>(i?.gas ?? "hydrogen");
+  const [payload, setPayload] = useState(i?.payload ?? 2.0);
+  const [mode, setMode] = useState<"ascentRate" | "neckLift">(i?.mode ?? "ascentRate");
+  const [target, setTarget] = useState(i?.target ?? 5.0);
+  const [neck, setNeck] = useState(i?.neck ?? 3.2);
+  const [siteAlt, setSiteAlt] = useState(i?.siteAlt ?? p.siteAltM);
+  const [chuteD, setChuteD] = useState(i?.chuteD ?? 1.2);
+  const [chuteCd, setChuteCd] = useState(i?.chuteCd ?? 0.75);
+  const [factor, setFactor] = useState(i?.factor ?? 1.0);
+  useEffect(() => { p.onSnapshot?.({ balloonId, gas, payload, mode, target, neck, siteAlt, chuteD, chuteCd, factor }); }, [balloonId, gas, payload, mode, target, neck, siteAlt, chuteD, chuteCd, factor]);
 
   type Calc = { error: string } | { b: ReturnType<typeof balloonById>; nl: number; pad: number; runs: { id: CdModel; name: string; run: ReturnType<typeof simulateAscent> }[]; cusf: ReturnType<typeof cusfBurstCalc>; desc: { massKg: number; chuteDiameterM: number; cd: number }; sens: { f: number; nl: number; pad: number; burst: number; t: number }[]; sensD: { fd: number; d: number; burst: number; t: number }[]; vSL: number; vSite: number; vBurst: number };
   const calc = useMemo((): Calc | null => {

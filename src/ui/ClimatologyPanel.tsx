@@ -11,19 +11,21 @@ import { km, nm, compass, deg } from "./format";
 const ALTS = [500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000, 21000, 22000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000, 31000, 32000];
 interface Landing { label: string; date: string; station?: string; lat: number; lon: number; rangeM: number; bearingDeg: number; eastM: number; northM: number; durationS: number; burstZ: number; clipped: boolean; error?: string; layers: any[] }
 
-export function ClimatologyPanel({ inputs }: { inputs: PredictInputs }) {
+export interface ClimatologySnapshot { source: string; months: number[]; selMode: "months" | "date"; centreDate: string; windowDays: number; yearFrom: number; yearTo: number; hour: "all" | "00" | "12"; landings: Landing[] | null }
+export function ClimatologyPanel({ inputs, initial, onSnapshot }: { inputs: PredictInputs; initial?: ClimatologySnapshot; onSnapshot?: (s: ClimatologySnapshot) => void }) {
   const [igra, setIgra] = useState<IgraBundle | null>(null);
   const [gfs, setGfs] = useState<GfsBundle | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [source, setSource] = useState<string>("INM00043063");
-  const [months, setMonths] = useState<number[]>([10, 11]);
-  const [selMode, setSelMode] = useState<"months" | "date">("months");
-  const [centreDate, setCentreDate] = useState("10-24");
-  const [windowDays, setWindowDays] = useState(10);
-  const [yearFrom, setYearFrom] = useState(2016);
-  const [yearTo, setYearTo] = useState(2026);
-  const [hour, setHour] = useState<"all" | "00" | "12">("all");
-  const [landings, setLandings] = useState<Landing[] | null>(null);
+  const [source, setSource] = useState<string>(initial?.source ?? "INM00043063");
+  const [months, setMonths] = useState<number[]>(initial?.months ?? [10, 11]);
+  const [selMode, setSelMode] = useState<"months" | "date">(initial?.selMode ?? "months");
+  const [centreDate, setCentreDate] = useState(initial?.centreDate ?? "10-24");
+  const [windowDays, setWindowDays] = useState(initial?.windowDays ?? 10);
+  const [yearFrom, setYearFrom] = useState(initial?.yearFrom ?? 2016);
+  const [yearTo, setYearTo] = useState(initial?.yearTo ?? 2026);
+  const [hour, setHour] = useState<"all" | "00" | "12">(initial?.hour ?? "all");
+  const [landings, setLandings] = useState<Landing[] | null>(initial?.landings ?? null);
+  useEffect(() => { onSnapshot?.({ source, months, selMode, centreDate, windowDays, yearFrom, yearTo, hour, landings }); }, [source, months, selMode, centreDate, windowDays, yearFrom, yearTo, hour, landings]);
   const [busy, setBusy] = useState(false);
   const [live, setLive] = useState<{ key: string; profiles: ArchiveProfile[] } | null>(null);
   const [liveStatus, setLiveStatus] = useState<string>("");

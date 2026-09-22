@@ -44,6 +44,21 @@ Verified 2026-09-20: `scripts/check_terrain_rgb.py` decodes the tile under the p
 Konkan to their known heights; in the browser every raster tile reports state `loaded` and the
 ground at zoom 15 around the pad renders in the 700 m colour of the legend.
 
+## Saved predictions (`Saved` tab)
+
+Every completed prediction is saved automatically in the browser's IndexedDB (database
+`boscon-hab-predictor`), and re-saved, debounced 1.5 s, whenever the burst-calculator,
+climatology or 3-D-view state of that prediction changes. A record holds everything needed to
+bring the run back without any network call: inputs, settings, the full wind grid (every column,
+level and hour that was fetched — about 3 MB for a 9×9 grid), the flight and its layers, the Monte
+Carlo landings and ellipses, the Tawhiri comparison, the weather columns, and the three tab
+snapshots. **Download** writes it as `<name>.habpred.json` (plain JSON, format
+`boscon-hab-prediction`, version 1), **Import** reads such a file back (an id collision gets a
+new id and "(imported)" in the name), **Delete** removes the browser copy only — the code in
+`src/data/store.ts` and `src/data/snapshot.ts`, round-trip test in
+`src/data/__tests__/snapshot.test.ts`. Storage is per browser profile and per site origin, so a
+record saved on `localhost` is not visible on the Vercel host; use Download/Import to move it.
+
 ## Hosting on Vercel
 
 The app is a static Vite build, so Vercel serves it from the repository with no server code.

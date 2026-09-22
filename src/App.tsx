@@ -4,6 +4,9 @@ import { BurstCalcPanel } from "./ui/BurstCalcPanel";
 import { ClimatologyPanel } from "./ui/ClimatologyPanel";
 import { MethodPanel } from "./ui/MethodPanel";
 import { Flight3D } from "./ui/Flight3D";
+import { SavedPanel } from "./ui/SavedPanel";
+import { GRID_PRESETS, DEFAULT_SETTINGS, buildSaved, restoreSaved, type Settings, type GridDensity, type Results, type TabSnapshots } from "./data/snapshot";
+import { putSaved, type SavedPrediction } from "./data/store";
 import { LineChart, PlanView, LayerBars } from "./ui/charts";
 import { km, nm, ft, fl, hhmm, deg, compass, istString, utcString, istToDate, dateToIstParts } from "./ui/format";
 import { BALLOONS, balloonById } from "./physics/balloon";
@@ -12,39 +15,14 @@ import { flyTrajectory, type FlightResult } from "./physics/trajectory";
 import { ellipsePolygon, type McResult } from "./physics/montecarlo";
 import { eastNorthM, distanceM, bearingDeg, dirSpeedFromUV } from "./physics/geo";
 import { isa } from "./physics/atmosphere";
-import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, fetchWeatherColumn, fetchSurfaceWeather, weatherCodeText, geocode, apiStats, OM_HOSTS, MODEL_LABEL, type ModelId, type GridFetchResult, type GeocodeHit, type WeatherColumn, type SurfaceWx } from "./data/openmeteo";
-import { fetchTawhiri, type TawhiriResult } from "./data/tawhiri";
+import { fetchGridField, fetchEnsemblePerturbations, fetchElevations, fetchWeatherColumn, fetchSurfaceWeather, weatherCodeText, geocode, apiStats, OM_HOSTS, MODEL_LABEL, type ModelId, type GeocodeHit, type SurfaceWx } from "./data/openmeteo";
+import { fetchTawhiri } from "./data/tawhiri";
 import { bridgeOnline, NOMADS_BRIDGE } from "./data/nomads";
 import { callWorker } from "./ui/worker-client";
 
-type Tab = "predict" | "flight3d" | "burst" | "climatology" | "method";
+type Tab = "predict" | "flight3d" | "burst" | "climatology" | "saved" | "method";
 
 import { DEFAULT_INPUTS } from "./physics/defaults";
-type GridDensity = "dense" | "standard" | "light";
-/**
- * Columns fetched around the pad (Open-Meteo models only; the NOMADS bridge always returns every
- * native grid point). Policy: data and accuracy are never traded for API quota — the default is
- * the model's own 0.25° spacing, and caching (30 min) is what keeps repeat runs free.
- */
-const GRID_PRESETS: Record<GridDensity, { step: number; half: number; label: string }> = {
-  dense: { step: 0.25, half: 1.0, label: "full — 9×9 columns at 0.25° (±110 km, the model's native spacing)" },
-  standard: { step: 0.5, half: 1.0, label: "5×5 columns at 0.5° (±110 km, Tawhiri's resolution)" },
-  light: { step: 0.75, half: 0.75, label: "3×3 columns at 0.75° (±80 km) — only if the API is throttling" },
-};
-interface Settings { model: ModelId; mcRuns: number; useEnsemble: boolean; compareTawhiri: boolean; windSigmaMs: number; burstMeanRatio: number; fillSigma: number; chuteCdSpread: number; remnant: boolean; hourSweep: boolean; grid: GridDensity }
-const DEFAULT_SETTINGS: Settings = { model: "gfs_seamless", mcRuns: 300, useEnsemble: true, compareTawhiri: true, windSigmaMs: 2.5, burstMeanRatio: 1.0, fillSigma: 0.05, chuteCdSpread: 0.2, remnant: true, hourSweep: true, grid: "dense" };
-
-interface Results {
-  grid: GridFetchResult; plan: ReturnType<typeof planFill>; nominal: FlightResult; groundAltM: number; demIterations: number;
-  mc?: McResult; ensembleN: number; tawhiri?: TawhiriResult; tawhiriError?: string;
-  hourly?: { offsetH: number; lat: number; lon: number; rangeM: number; bearing: number; durationS: number }[];
-  computedAt: Date;
-  demError?: string;
-  weather?: WeatherColumn;
-  landingWx?: SurfaceWx[];
-  weatherError?: string;
-}
-
 export default function App() {
   const [tab, setTab] = useState<Tab>("predict");
   const [inp, setInp] = useState<PredictInputs>(DEFAULT_INPUTS);
@@ -56,6 +34,43 @@ export default function App() {
   const [fitKey, setFitKey] = useState("");
   const abort = useRef<AbortController | null>(null);
   const [bridge, setBridge] = useState<boolean | null>(null);
+  const tabs = useRef<TabSnapshots>({});
+  const [savedVersion, setSavedVersion] = useState(0);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+  const [loadKey, setLoadKey] = useState(0);
+  const [initialTabs, setInitialTabs] = useState<TabSnapshots>({});
+  const currentName = useRef<string>("");
+  const resaveTimer = useRef<number | null>(null);
+  const lastTabsJson = useRef<string>("");
+  // Keep the saved record in step with the burst-calculator, climatology and 3-D view state.
+  // Debounced so slider drags do not rewrite a multi-megabyte record on every step.
+  function scheduleResave() {
+    if (!currentId || !res) return;
+    const j = JSON.stringify(tabs.current);
+    if (j === lastTabsJson.current) return;
+    if (resaveTimer.current) window.clearTimeout(resaveTimer.current);
+    resaveTimer.current = window.setTimeout(async () => {
+      resaveTimer.current = null;
+      try {
+        lastTabsJson.current = JSON.stringify(tabs.current);
+        await putSaved(buildSaved({ id: currentId, name: currentName.current || suggestedName(), place: placeQuery.trim() || undefined, inputs: inp, settings: set, results: res, tabs: tabs.current }));
+        setSavedVersion(v => v + 1);
+      } catch (e) { console.warn("re-save failed", e); }
+    }, 1500);
+  }
+  const suggestedName = () => `${placeQuery.trim() || `${inp.launchLat.toFixed(3)}, ${inp.launchLon.toFixed(3)}`} · ${istString(inp.launchUtc)} · ${MODEL_LABEL[set.model].split(" — ")[0].replace(" via Open-Meteo", "").replace(" native via local NOMADS bridge", " native")}`;
+  async function saveCurrent(name: string, results: Results | null = res): Promise<string | null> {
+    if (!results) return null;
+    const rec = buildSaved({ name, place: placeQuery.trim() || undefined, inputs: inp, settings: set, results, tabs: tabs.current });
+    await putSaved(rec); setCurrentId(rec.meta.id); currentName.current = rec.meta.name; lastTabsJson.current = JSON.stringify(tabs.current); setSavedVersion(v => v + 1);
+    return rec.meta.id;
+  }
+  function loadSaved(rec: SavedPrediction) {
+    const r = restoreSaved(rec);
+    setInp(r.inputs); setSet(r.settings); setRes(r.results); setError(null); setStatus(`Loaded "${rec.meta.name}" (saved ${istString(new Date(rec.meta.savedAt))}).`);
+    setPlaceQuery(rec.meta.place ?? ""); setPlaceHits(null);
+    tabs.current = r.tabs; lastTabsJson.current = JSON.stringify(r.tabs); setInitialTabs(r.tabs); setLoadKey(k => k + 1); setCurrentId(rec.meta.id); currentName.current = rec.meta.name; setFitKey(String(Date.now())); setTab("predict");
+  }
   useEffect(() => { bridgeOnline().then(ok => { setBridge(ok); if (ok) setSet(s => (s.model === DEFAULT_SETTINGS.model ? { ...s, model: "nomads_gfs025" } : s)); }); }, []);
   const [placeQuery, setPlaceQuery] = useState("");
   const [placeHits, setPlaceHits] = useState<GeocodeHit[] | null>(null);
@@ -137,7 +152,8 @@ export default function App() {
       partial.mc = mcMsg.result;
       setRes({ ...partial });
       await tawhiriP;
-      log(`Done at ${istString(new Date())} — ${apiStats.requests - req0} Open-Meteo request${apiStats.requests - req0 === 1 ? "" : "s"} this run (${apiStats.cacheHits} cache hits so far).`);
+      try { await saveCurrent(suggestedName(), partial); } catch (e) { console.warn("auto-save failed", e); }
+      log(`Done at ${istString(new Date())} — ${apiStats.requests - req0} Open-Meteo request${apiStats.requests - req0 === 1 ? "" : "s"} this run (${apiStats.cacheHits} cache hits so far). Saved to the Saved tab.`);
     } catch (e: any) {
       if (e?.name !== "AbortError") setError(String(e.message ?? e));
     } finally { setBusy(false); }
@@ -160,12 +176,13 @@ export default function App() {
   return <div className="app">
     <div className="topbar">
       <h1>BOSCON HAB predictor</h1><span className="note">landing prediction · burst calculator · Pune wind climatology</span>
-      <div className="tabs">{(["predict", "flight3d", "burst", "climatology", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", flight3d: "3-D flight", burst: "Burst calculator", climatology: "Climatology", method: "Method & sources" }[t]}</button>)}</div>
+      <div className="tabs">{(["predict", "flight3d", "burst", "climatology", "saved", "method"] as Tab[]).map(t => <button key={t} className={"tab" + (tab === t ? " active" : "")} onClick={() => setTab(t)}>{{ predict: "Predict", flight3d: "3-D flight", burst: "Burst calculator", climatology: "Climatology", saved: "Saved", method: "Method & sources" }[t]}</button>)}</div>
     </div>
-    {tab === "flight3d" && <Flight3D data={res ? { nominal: res.nominal, mc: res.mc, tawhiri: res.tawhiri, grid: res.grid, weather: res.weather } : null} launchLat={inp.launchLat} launchLon={inp.launchLon} launchAltM={inp.launchAltM} />}
-    {tab === "burst" && <BurstCalcPanel siteAltM={inp.launchAltM} />}
+    {tab === "flight3d" && <Flight3D key={"f" + loadKey} data={res ? { nominal: res.nominal, mc: res.mc, tawhiri: res.tawhiri, grid: res.grid, weather: res.weather } : null} launchLat={inp.launchLat} launchLon={inp.launchLon} launchAltM={inp.launchAltM} initial={initialTabs.flight3d} onSnapshot={s => { tabs.current.flight3d = s; scheduleResave(); }} />}
+    {tab === "burst" && <BurstCalcPanel key={"b" + loadKey} siteAltM={inp.launchAltM} initial={initialTabs.burstCalc} onSnapshot={s => { tabs.current.burstCalc = s; scheduleResave(); }} />}
+    {tab === "saved" && <SavedPanel version={savedVersion} currentId={currentId} onLoad={loadSaved} onSaveCurrent={n => saveCurrent(n)} hasCurrent={!!res} suggestedName={suggestedName()} />}
     {tab === "method" && <MethodPanel />}
-    {tab === "climatology" && <ClimatologyPanel inputs={inp} />}
+    {tab === "climatology" && <ClimatologyPanel key={"c" + loadKey} inputs={inp} initial={initialTabs.climatology} onSnapshot={s => { tabs.current.climatology = s; scheduleResave(); }} />}
     {tab === "predict" && <div className="main">
       <div className="sidebar">
         <h2>Launch</h2>
