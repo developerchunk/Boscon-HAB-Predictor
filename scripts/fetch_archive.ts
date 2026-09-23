@@ -6,7 +6,9 @@
  *   npx tsx scripts/fetch_archive.ts --lat 17.721666 --lon 75.84237 --name "Solapur pad" \
  *       --from 2021-04 --to 2026-09 --out public/data/archives/solapur.habarchive.json.gz
  *
- * Each month is cached in .cache/archive/<loc>/<ym>.json as it arrives, so a stopped run resumes.
+ * Each month is cached in .cache/archive/<loc>/<ym>.json as it arrives, so a stopped run resumes; a cached
+ * month whose file is older than the month's end (fetched while the month was still running, so its later days
+ * are advance forecasts) is fetched again.
  * The month payload is exactly what src/data/openmeteo.ts fetchArchiveMonth returns ({time, vars}),
  * and the bundle is {format: "boscon-hab-archive", version: 1, loc, lat, lon, name, fetchedAt,
  * months: {"YYYY-MM": {time, vars}}} gzipped. A per-minute 429 is waited out; an hourly one stops
@@ -54,7 +56,9 @@ async function fetchMonth(ym: string): Promise<{ time: string[]; vars: Record<st
   console.log(`${name} (${loc}): ${months.length} months ${months[0]} .. ${months[months.length - 1]}`);
   for (const [i, ym] of months.entries()) {
     const f = `${cacheDir}/${ym}.json`;
-    if (existsSync(f)) { console.log(`${i + 1}/${months.length} ${ym}: cached (${(statSync(f).size / 1024).toFixed(0)} kB)`); continue; }
+    const [yy, mm] = ym.split("-").map(Number);
+    if (existsSync(f) && statSync(f).mtimeMs >= Date.UTC(yy, mm, 1)) { console.log(`${i + 1}/${months.length} ${ym}: cached (${(statSync(f).size / 1024).toFixed(0)} kB)`); continue; }
+    if (existsSync(f)) console.log(`${i + 1}/${months.length} ${ym}: cached copy was fetched before the month ended — fetching again`);
     const t1 = Date.now();
     const m = await fetchMonth(ym);
     const text = JSON.stringify(m); writeFileSync(f, text); fetched++; bytes += text.length;

@@ -96,6 +96,15 @@ npx tsx scripts/fetch_archive.ts --lat 17.721666 --lon 75.84237 --name "Solapur 
 then add it to `BUNDLED_ARCHIVES` in `src/data/archive.ts`. The script caches each month in
 `.cache/archive/` so a stopped run resumes; it waits out per-minute 429s and stops on the hourly one.
 
+A month fetched before its own last day (the bundled September 2026 was fetched on the 22nd) is
+stored with that fetch date and marked incomplete. Checked 2026-09-23 on that month: the
+historical-forecast API returned values for all 720 hours, so the days after the fetch date hold
+the forecast it had at the time, not each day's own analysis. The next Download in the
+Climatology tab, the next install of a newer bundle, and the next script run fetch such a month
+again (verified: one request, 347 kB, 5 s). The card says which months that applies to, and the
+Storage tab marks them. The bundled file itself only changes when the script is rerun and the
+entry updated.
+
 The same file format is what the Storage tab's **Download** writes for any stored archive and what
 **Import archive file…** reads, so an archive fetched in one browser can be moved to another (or to
 the Vercel host, which has its own storage) without fetching it again.

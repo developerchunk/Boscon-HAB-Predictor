@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { deleteArchiveMonth, deleteDatabase, deleteSaved, fmtBytes, listArchiveLocations, listArchiveMonths, listSaved, storageEstimate, type ArchiveLoc, type SavedMeta } from "../data/store";
+import { deleteArchiveMonth, deleteDatabase, deleteSaved, fmtBytes, isMonthComplete, listArchiveLocations, listArchiveMonths, listSaved, storageEstimate, type ArchiveLoc, type SavedMeta } from "../data/store";
 import { cacheEntries, clearCache } from "../data/openmeteo";
 import { clearTileCache, tileCacheStats } from "../data/terrainrgb";
 import { archiveDownloader, ARCHIVE_EXT, BUNDLED_ARCHIVES, deleteArchiveLocation, exportArchive, setBundledAutoInstall } from "../data/archive";
@@ -141,7 +141,7 @@ export function StoragePanel(p: { currentId: string | null; onPredictionsDeleted
     {archs.length ? <table className="t"><thead><tr><th /><th>archive</th><th>point</th><th>months</th><th>size</th><th /></tr></thead><tbody>
       {archs.flatMap(a => [
         <tr key={a.loc}><td>{cb(`arch:${a.loc}`)}</td><td><button className="secondary" style={{ padding: "2px 8px" }} onClick={() => setOpenArch(s => { const n = new Set(s); if (n.has(a.loc)) n.delete(a.loc); else n.add(a.loc); return n; })}>{openArch.has(a.loc) ? "▾" : "▸"}</button> {a.name}</td><td>{a.loc}</td><td>{a.months[0]} – {a.months[a.months.length - 1]} ({a.months.length})</td><td>{fmtBytes(a.bytes)}</td><td><button className="secondary" disabled={busy} onClick={() => exportArchive(a.loc).catch(e => setMsg(String(e?.message ?? e)))}>Download</button> {del(`arch:${a.loc}`, "Delete", running)}</td></tr>,
-        ...(openArch.has(a.loc) ? (months[a.loc] ?? []).map(m => <tr key={`${a.loc}|${m.ym}`} style={{ color: "var(--text-2)" }}><td>{cb(`month:${a.loc}|${m.ym}`)}</td><td style={{ paddingLeft: 36 }}>{m.ym}</td><td /><td>fetched {istString(new Date(m.fetchedAt))}</td><td>{fmtBytes(m.bytes)}</td><td>{del(`month:${a.loc}|${m.ym}`, "Delete", running)}</td></tr>) : []),
+        ...(openArch.has(a.loc) ? (months[a.loc] ?? []).map(m => <tr key={`${a.loc}|${m.ym}`} style={{ color: "var(--text-2)" }}><td>{cb(`month:${a.loc}|${m.ym}`)}</td><td style={{ paddingLeft: 36 }}>{m.ym}{isMonthComplete(m.ym, m.fetchedAt) ? "" : " (fetched before the month ended: its later days are advance forecasts until the next download refetches it)"}</td><td /><td>fetched {istString(new Date(m.fetchedAt))}</td><td>{fmtBytes(m.bytes)}</td><td>{del(`month:${a.loc}|${m.ym}`, "Delete", running)}</td></tr>) : []),
       ])}
     </tbody></table> : <p className="note">none</p>}
 

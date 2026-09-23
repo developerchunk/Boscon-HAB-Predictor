@@ -79,6 +79,11 @@ export async function exportArchive(loc: string): Promise<void> {
 
 export const ymNow = () => { const d = new Date(); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`; };
 export const ymValid = (s: string) => /^\d{4}-(0[1-9]|1[0-2])$/.test(s);
+/** Which of `wanted` a download has to fetch: months not stored, plus stored months that were fetched before they ended. */
+export function monthsToFetch(wanted: string[], stored: { months: string[]; incomplete?: string[] } | null): string[] {
+  const have = new Set(stored?.months ?? []), partial = new Set(stored?.incomplete ?? []);
+  return wanted.filter(ym => !have.has(ym) || partial.has(ym));
+}
 /** Every "YYYY-MM" from `from` to `to` inclusive, clipped to what the archive can have (April 2021 .. this month). */
 export function monthsBetween(from: string, to: string, now = ymNow()): string[] {
   if (!ymValid(from) || !ymValid(to)) return [];
@@ -121,8 +126,7 @@ export const archiveDownloader = {
   async start(o: { lat: number; lon: number; name: string; months: string[] }): Promise<void> {
     if (state.running) return;
     const loc = archiveLocKey(o.lat, o.lon);
-    const have = new Set((await getArchiveLocation(loc))?.months ?? []);
-    const jobs = o.months.filter(ym => !have.has(ym));
+    const jobs = monthsToFetch(o.months, await getArchiveLocation(loc));
     abort = new AbortController();
     state = { ...idle(), loc, name: o.name, running: true, total: o.months.length, skipped: o.months.length - jobs.length, done: o.months.length - jobs.length, startedAt: Date.now() }; notify();
     let fetched = 0, fetchMs = 0;
@@ -157,14 +161,14 @@ export const archiveDownloader = {
       set({ phase: "decompressing" });
       const bundle = parseArchiveBundle(await gunzipToText(bytes));
       const loc = archiveLocKey(bundle.lat, bundle.lon);
-      const have = new Set((await getArchiveLocation(loc))?.months ?? []);
       const yms = Object.keys(bundle.months).sort();
-      const jobs = yms.filter(ym => !have.has(ym));
+      // months the browser lacks, or holds only partially, are written from the file
+      const jobs = monthsToFetch(yms, await getArchiveLocation(loc));
       set({ loc, name: bundle.name || src.label, phase: "writing months", total: yms.length, skipped: yms.length - jobs.length, done: yms.length - jobs.length });
       for (const ym of jobs) {
         if (abort.signal.aborted) throw new DOMException("aborted", "AbortError");
         set({ current: ym });
-        await putArchiveMonth({ lat: bundle.lat, lon: bundle.lon, name: bundle.name || src.label, ym, text: JSON.stringify(bundle.months[ym]) });
+        await putArchiveMonth({ lat: bundle.lat, lon: bundle.lon, name: bundle.name || src.label, ym, text: JSON.stringify(bundle.months[ym]), fetchedAt: bundle.fetchedAt });
         set({ done: state.done + 1 });
         await new Promise(r => setTimeout(r, 0));
       }

@@ -272,7 +272,8 @@ const archiveVars = () => { const v: string[] = []; for (const p of MODEL_LEVELS
 export async function fetchArchiveMonth(o: { lat: number; lon: number; y: number; mo: number; signal?: AbortSignal }): Promise<ArchiveMonth> {
   const last = new Date(Date.UTC(o.y, o.mo, 0)).getUTCDate();
   const url = `${OM_HOSTS.archive}?latitude=${o.lat}&longitude=${o.lon}&start_date=${o.y}-${String(o.mo).padStart(2, "0")}-01&end_date=${o.y}-${String(o.mo).padStart(2, "0")}-${last}&hourly=${archiveVars().join(",")}&models=gfs_seamless&wind_speed_unit=ms&timezone=UTC`;
-  const d = await cached(`arch|${o.lat.toFixed(2)},${o.lon.toFixed(2)}|${o.y}-${o.mo}`, 24 * 3600e3, () => omFetch(url, o.signal, "Open-Meteo archive"));
+  const monthOver = Date.now() >= Date.UTC(o.y, o.mo, 1); // a month still running changes daily, so it is not memoised
+  const d = await cached(`arch|${o.lat.toFixed(2)},${o.lon.toFixed(2)}|${o.y}-${o.mo}`, monthOver ? 24 * 3600e3 : 0, () => omFetch(url, o.signal, "Open-Meteo archive"));
   const h = d.hourly ?? {}; const vars: Record<string, (number | null)[]> = {};
   for (const k of archiveVars()) if (h[k]) vars[k] = h[k];
   return { time: h.time ?? [], vars };

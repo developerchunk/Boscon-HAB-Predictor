@@ -4,7 +4,7 @@ import { planFill, buildFlightConfig, type PredictInputs } from "../physics/pred
 import { isa } from "../physics/atmosphere";
 import { callWorker } from "./worker-client";
 import { type ArchiveProfile } from "../data/openmeteo";
-import { archiveDownloader, archiveLocKey, BUNDLED_ARCHIVES, bundledAutoInstallAllowed, setBundledAutoInstall, deleteArchiveLocation, listArchiveLocations, loadArchiveProfiles, monthsBetween, rememberedMsPerMonth, ymNow, ymValid, type ArchiveLoc } from "../data/archive";
+import { archiveDownloader, archiveLocKey, BUNDLED_ARCHIVES, bundledAutoInstallAllowed, setBundledAutoInstall, deleteArchiveLocation, listArchiveLocations, loadArchiveProfiles, monthsBetween, monthsToFetch, rememberedMsPerMonth, ymNow, ymValid, type ArchiveLoc } from "../data/archive";
 import { fmtBytes } from "../data/store";
 import { distanceM } from "../physics/geo";
 import { BandChart, PlanView, Histogram, LineChart } from "./charts";
@@ -78,7 +78,8 @@ export function ClimatologyPanel({ inputs, placeName, initial, onSnapshot }: { i
   const [dlOnlySel, setDlOnlySel] = useState(false);
   const selMonthsSet = useMemo(() => { if (selMode === "months") return new Set(months); const [cm, cd] = centreDate.split("-").map(Number); return new Set([-1, 0, 1].map(k => new Date(Date.UTC(2026, cm - 1, cd + k * windowDays)).getUTCMonth() + 1)); }, [selMode, months, centreDate, windowDays]);
   const dlMonths = useMemo(() => monthsBetween(dlFrom, dlTo).filter(ym => !dlOnlySel || selMonthsSet.has(+ym.slice(5, 7))), [dlFrom, dlTo, dlOnlySel, selMonthsSet]);
-  const dlNew = dlMonths.filter(ym => !padArch?.months.includes(ym));
+  const dlNew = monthsToFetch(dlMonths, padArch);
+  const dlPartial = dlNew.filter(ym => padArch?.incomplete?.includes(ym));
   const msPerMonth = dl.msPerMonth || rememberedMsPerMonth();
   const dlIsThisPad = dl.loc === padLoc;
   function startDownload() {
@@ -148,7 +149,7 @@ export function ClimatologyPanel({ inputs, placeName, initial, onSnapshot }: { i
           <div className="field"><label>Only the months selected above ({[...selMonthsSet].sort((a, b) => a - b).map(m => MONTH_NAMES[m - 1]).join(", ")})</label><input type="checkbox" checked={dlOnlySel} onChange={e => setDlOnlySel(e.target.checked)} /></div>
           <div className="note" style={{ margin: "4px 0" }}>
             {dlMonths.length === 0 ? "No months in that range (the archive covers April 2021 to this month)." : <>
-              <b>{dlNew.length} month{dlNew.length === 1 ? "" : "s"} to download</b>{dlMonths.length - dlNew.length > 0 ? ` (${dlMonths.length - dlNew.length} of the ${dlMonths.length} already stored, skipped)` : ""}
+              <b>{dlNew.length} month{dlNew.length === 1 ? "" : "s"} to download</b>{dlMonths.length - dlNew.length > 0 ? ` (${dlMonths.length - dlNew.length} of the ${dlMonths.length} already stored, skipped)` : ""}{dlPartial.length > 0 ? ` — ${dlPartial.join(", ")} ${dlPartial.length === 1 ? "was" : "were"} fetched before the month had ended, so the later days hold forecasts made in advance; fetched again to replace them with each day's own analysis` : ""}
               {dlNew.length > 0 && <>, about {fmtBytes(dlNew.length * EST_BYTES_PER_MONTH)} (measured {fmtBytes(EST_BYTES_PER_MONTH)} per month) and about <b>{mmss(dlNew.length * (msPerMonth ?? ASSUMED_MS_PER_MONTH))}</b> at {((msPerMonth ?? ASSUMED_MS_PER_MONTH) / 1000).toFixed(1)} s per month ({msPerMonth ? "measured on the last download from this browser" : "the 2026-09-22 measurement, until this browser has measured its own"}). This can take a while for the full archive; it keeps running while you use other tabs, every month is kept as it arrives, and it uses part of the free Open-Meteo hourly quota (one request per month, weighted as several calls) — if the quota stops it, press Download again next hour to resume.</>}</>}
           </div>
           {BUNDLED_ARCHIVES.length > 0 && <div className="note" style={{ margin: "6px 0" }}><b>Bundled with this site</b> (installs from the site, no Open-Meteo request): {BUNDLED_ARCHIVES.map(b => { const have = archLocs.find(l => l.loc === b.loc); const complete = !!have && have.months.length >= b.monthCount; return <span key={b.loc} style={{ display: "inline-block", marginRight: 12 }}>{b.name} ({b.loc}), {b.from} – {b.to}, {b.monthCount} months, {b.gzBytes ? fmtBytes(b.gzBytes) + " compressed" : "gzip"}, fetched {b.fetched}{b.loc === padLoc ? " — this pad" : ""}: {complete ? <span>installed</span> : <button className="secondary" style={{ padding: "2px 8px" }} disabled={dl.running} onClick={() => installBundled(b)}>{have ? `Install the missing ${b.monthCount - have.months.length} months` : "Install"}</button>}</span>; })}</div>}

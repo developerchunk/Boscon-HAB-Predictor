@@ -112,30 +112,47 @@ export const fmtBytes = (b: number) => (b >= 1048576 ? `${(b / 1048576).toFixed(
 
 /* ------------------------------------------------------------------ downloaded GFS archives */
 /** One downloaded location: which months are present and how much they take. */
-export interface ArchiveLoc { loc: string; lat: number; lon: number; name: string; months: string[]; bytes: number; updatedAt: string }
+export interface ArchiveLoc { loc: string; lat: number; lon: number; name: string; months: string[]; bytes: number; updatedAt: string;
+  /** months fetched before their own last day had passed: the API fills the remaining days with the forecast it had at the time, so the next download fetches them again */
+  incomplete?: string[] }
+/** The first instant after month "YYYY-MM", UTC. A month fetched before this is not final. */
+export const monthEndMs = (ym: string) => { const [y, m] = ym.split("-").map(Number); return Date.UTC(y, m, 1); };
+export const isMonthComplete = (ym: string, fetchedAtIso: string) => Date.parse(fetchedAtIso) >= monthEndMs(ym);
 export interface ArchiveMonthRow { key: string; loc: string; ym: string; text: string; bytes: number; fetchedAt: string }
 export const archiveLocKey = (lat: number, lon: number) => `${lat.toFixed(2)},${lon.toFixed(2)}`;
+/** Location rows written before the incomplete-month rule get the field derived once from their months' fetch dates. */
+async function withIncomplete(db: IDBDatabase, rec: ArchiveLoc): Promise<ArchiveLoc> {
+  if (rec.incomplete) return rec;
+  const incomplete: string[] = [];
+  for (const ym of rec.months) { const row = await tx<ArchiveMonthRow | undefined>(db, ["archMonths"], "readonly", t => t.objectStore("archMonths").get(`${rec.loc}|${ym}`)); if (row && !isMonthComplete(ym, row.fetchedAt)) incomplete.push(ym); }
+  const out = { ...rec, incomplete };
+  await tx(db, ["archLocs"], "readwrite", t => t.objectStore("archLocs").put(out));
+  return out;
+}
 export async function listArchiveLocations(): Promise<ArchiveLoc[]> {
   const db = await openDb();
   const all = await tx<ArchiveLoc[]>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").getAll());
+  const out: ArchiveLoc[] = []; for (const r of all ?? []) out.push(await withIncomplete(db, r));
   db.close();
-  return (all ?? []).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 export async function getArchiveLocation(loc: string): Promise<ArchiveLoc | null> {
   const db = await openDb();
   const row = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
+  const out = row ? await withIncomplete(db, row) : null;
   db.close();
-  return row ?? null;
+  return out;
 }
 /** Store one month and update the location row (creating it if needed). Returns the updated location. */
-export async function putArchiveMonth(o: { lat: number; lon: number; name: string; ym: string; text: string }): Promise<ArchiveLoc> {
+export async function putArchiveMonth(o: { lat: number; lon: number; name: string; ym: string; text: string; /** when the data was fetched from Open-Meteo (a bundled file carries its own date); default now */ fetchedAt?: string }): Promise<ArchiveLoc> {
   const loc = archiveLocKey(o.lat, o.lon);
   const db = await openDb();
   const prev = await tx<ArchiveLoc | undefined>(db, ["archLocs"], "readonly", t => t.objectStore("archLocs").get(loc));
   const old = await tx<ArchiveMonthRow | undefined>(db, ["archMonths"], "readonly", t => t.objectStore("archMonths").get(`${loc}|${o.ym}`));
-  const row: ArchiveMonthRow = { key: `${loc}|${o.ym}`, loc, ym: o.ym, text: o.text, bytes: o.text.length, fetchedAt: new Date().toISOString() };
+  const row: ArchiveMonthRow = { key: `${loc}|${o.ym}`, loc, ym: o.ym, text: o.text, bytes: o.text.length, fetchedAt: o.fetchedAt ?? new Date().toISOString() };
   const months = [...new Set([...(prev?.months ?? []), o.ym])].sort();
-  const rec: ArchiveLoc = { loc, lat: o.lat, lon: o.lon, name: o.name || prev?.name || loc, months, bytes: (prev?.bytes ?? 0) - (old?.bytes ?? 0) + row.bytes, updatedAt: row.fetchedAt };
+  const incomplete = (prev?.incomplete ?? []).filter(m => m !== o.ym); if (!isMonthComplete(o.ym, row.fetchedAt)) incomplete.push(o.ym);
+  const rec: ArchiveLoc = { loc, lat: o.lat, lon: o.lon, name: o.name || prev?.name || loc, months, bytes: (prev?.bytes ?? 0) - (old?.bytes ?? 0) + row.bytes, updatedAt: new Date().toISOString(), incomplete: incomplete.sort() };
   await tx(db, ["archLocs", "archMonths"], "readwrite", t => { t.objectStore("archMonths").put(row); t.objectStore("archLocs").put(rec); });
   db.close();
   return rec;
@@ -167,7 +184,7 @@ export async function deleteArchiveMonth(loc: string, ym: string): Promise<void>
     t.objectStore("archMonths").delete(`${loc}|${ym}`);
     if (rec) {
       const months = rec.months.filter(m => m !== ym);
-      if (months.length) t.objectStore("archLocs").put({ ...rec, months, bytes: Math.max(0, rec.bytes - (row?.bytes ?? 0)), updatedAt: new Date().toISOString() });
+      if (months.length) t.objectStore("archLocs").put({ ...rec, months, incomplete: (rec.incomplete ?? []).filter(m => m !== ym), bytes: Math.max(0, rec.bytes - (row?.bytes ?? 0)), updatedAt: new Date().toISOString() });
       else t.objectStore("archLocs").delete(loc);
     }
   });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { monthsBetween, parseArchiveBundle, ymValid, ARCHIVE_FORMAT } from "../archive";
+import { monthsBetween, monthsToFetch, parseArchiveBundle, ymValid, ARCHIVE_FORMAT } from "../archive";
+import { isMonthComplete } from "../store";
 import fetchScript from "../../../scripts/fetch_archive.ts?raw";
 import { archiveMonthToProfiles, MODEL_LEVELS, type ArchiveMonth } from "../openmeteo";
 
@@ -50,5 +51,19 @@ describe("archive bundles", () => {
     const m = fetchScript.match(/const GFS_LEVELS = \[([^\]]+)\]/);
     expect(m).not.toBeNull();
     expect(m![1].split(",").map(Number)).toEqual(MODEL_LEVELS.gfs_seamless);
+  });
+});
+
+describe("incomplete months", () => {
+  it("a month fetched before its last day is not complete", () => {
+    expect(isMonthComplete("2026-09", "2026-09-22T03:30:00Z")).toBe(false);
+    expect(isMonthComplete("2026-08", "2026-09-22T03:30:00Z")).toBe(true);
+    expect(isMonthComplete("2026-09", "2026-10-01T00:00:00Z")).toBe(true);
+    expect(isMonthComplete("2026-09", "2026-09-30T23:59:59Z")).toBe(false);
+  });
+  it("monthsToFetch refetches stored months that were incomplete", () => {
+    const stored = { months: ["2026-07", "2026-08", "2026-09"], incomplete: ["2026-09"] };
+    expect(monthsToFetch(["2026-06", "2026-07", "2026-08", "2026-09", "2026-10"], stored)).toEqual(["2026-06", "2026-09", "2026-10"]);
+    expect(monthsToFetch(["2026-08"], null)).toEqual(["2026-08"]);
   });
 });
